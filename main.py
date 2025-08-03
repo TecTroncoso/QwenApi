@@ -168,8 +168,14 @@ def _build_qwen_completion_payload(chat_id: str, message: OpenAIMessage) -> Dict
         "timestamp": current_timestamp,
     }
 
-def _format_sse_chunk(data: BaseModel) -> str:
-    json_str = JSON_SERIALIZER(data.model_dump(exclude_unset=True), default=str)
+def _format_sse_chunk(data: BaseModel | dict) -> str:
+    """Formatea un objeto Pydantic o un diccionario en un string Server-Sent Event."""
+    if isinstance(data, BaseModel):
+        # Si es un objeto Pydantic, usamos model_dump
+        json_str = JSON_SERIALIZER(data.model_dump(exclude_unset=True), default=str)
+    else:
+        # Si es un diccionario, lo serializamos directamente
+        json_str = JSON_SERIALIZER(data, default=str)
     return f"data: {json_str}\n\n"
 
 async def stream_qwen_to_openai_format(
@@ -204,7 +210,7 @@ async def stream_qwen_to_openai_format(
         "model": requested_model,
         "choices": []  # No enviamos contenido, solo metadatos
     }
-    yield _format_sse_chunk(BaseModel.model_validate(initial_chunk_data))
+    yield _format_sse_chunk(initial_chunk_data)
     # --- FIN DE LA MODIFICACIÓN ---
 
     try:
@@ -384,6 +390,7 @@ async def chat_completions_endpoint(
 @app.get("/", summary="Estado del Servicio")
 def read_root():
     return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
 
 
 
