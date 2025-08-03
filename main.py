@@ -37,11 +37,30 @@ MODEL_QWEN_THINKING = "qwen-thinking"
 QWEN_INTERNAL_MODEL = "qwen3-235b-a22b"
 
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
-QWEN_AUTH_TOKEN = os.getenv("QWEN_AUTH_TOKEN")
-QWEN_COOKIE = os.getenv("QWEN_COOKIE")
 
-if not QWEN_AUTH_TOKEN or not QWEN_COOKIE:
-    raise RuntimeError("Las variables de entorno QWEN_AUTH_TOKEN y QWEN_COOKIE deben estar definidas en un archivo .env.")
+# --- Secretos cargados desde el entorno de Koyeb ---
+QWEN_AUTH_TOKEN = os.getenv("QWEN_AUTH_TOKEN")
+QWEN_COOKIES_JSON_B64 = os.getenv("QWEN_COOKIES_JSON_B64")
+UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
+
+if not QWEN_AUTH_TOKEN or not UPSTASH_REDIS_URL:
+    raise RuntimeError("Las variables de entorno QWEN_AUTH_TOKEN y UPSTASH_REDIS_URL deben estar definidas.")
+
+# --- Función Auxiliar para Formatear Cookies ---
+def format_cookies_from_b64(b64_string: str | None) -> str:
+    """Decodifica un string Base64 que contiene un JSON de cookies y lo formatea
+    en un string de cabecera 'Cookie'."""
+    if not b64_string:
+        print("[WARN] La variable de cookies no está definida. La API podría no funcionar hasta que el workflow la actualice.")
+        return ""
+    try:
+        cookies_list = JSON_DESERIALIZER(base64.b64decode(b64_string))
+        return "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
+    except Exception as e:
+        print(f"[ERROR CRÍTICO] No se pudieron decodificar o formatear las cookies: {e}")
+        return ""
+
+QWEN_COOKIE_STRING = format_cookies_from_b64(QWEN_COOKIES_JSON_B64)
 
 QWEN_HEADERS = {
     "Accept": "application/json", "Accept-Language": "es-AR,es;q=0.7", "Authorization": QWEN_AUTH_TOKEN,
@@ -53,6 +72,19 @@ QWEN_HEADERS = {
 
 MIN_CHAT_ID_POOL_SIZE = 1
 MAX_CHAT_ID_POOL_SIZE = 2
+
+REDIS_POOL_KEY = "qwen_chat_id_pool"  # Nombre de la clave en Redis
+try:
+    redis_client = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    print("✅ Conexión a Redis (Upstash) exitosa.")
+except Exception as e:
+    print(f"❌ ERROR CRÍTICO AL CONECTAR CON REDIS: {e}")
+    print("La persistencia del pool de Chat IDs estará desactivada.")
+    redis_client = None
+
+# --- Estado Global de la Aplicación ---
+app_state: Dict[str, Any] = {}
 
 # ==============================================================================
 # --- 2. MODELOS DE DATOS (Pydantic) ---
@@ -158,25 +190,20 @@ async def stream_qwen_to_openai_format(
 # ==============================================================================
 # --- 4. GESTIÓN DEL CICLO DE VIDA, POOL Y DEPENDENCIAS ---
 # ==============================================================================
-app_state: Dict[str, Any] = {}
 
 async def chat_id_pool_manager(client: httpx.AsyncClient, queue: asyncio.Queue):
-    print("Iniciando gestor del pool de Chat IDs...")
+    """Tarea en segundo plano que mantiene el pool de Chat IDs lleno."""
     while True:
         try:
             if queue.qsize() < MIN_CHAT_ID_POOL_SIZE:
                 num_to_create = MAX_CHAT_ID_POOL_SIZE - queue.qsize()
-                print(f"Pool bajo mínimos ({queue.qsize()}). Creando {num_to_create} nuevos Chat IDs...")
-                tasks = [create_qwen_chat(client) for _ in range(num_to_create)]
-                results = await asyncio.gather(*tasks)
-                new_ids = [chat_id for chat_id in results if chat_id]
-                for chat_id in new_ids:
-                    await queue.put(chat_id)
-                if new_ids:
-                    print(f"Añadidos {len(new_ids)} Chat IDs al pool. Tamaño actual: {queue.qsize()}")
-            await asyncio.sleep(5)
+                if num_to_create > 0:
+                    print(f"Pool bajo mínimos ({queue.qsize()}). Creando {num_to_create} nuevos Chat IDs...")
+                    tasks = [create_qwen_chat(client) for _ in range(num_to_create)]
+                    results = await asyncio.gather(*tasks)
+                    for chat_id in filter(None, results): await queue.put(chat_id)
+            await asyncio.sleep(10)
         except asyncio.CancelledError:
-            print("Gestor del pool de Chat IDs cancelado. Terminando.")
             break
         except Exception as e:
             print(f"[ERROR CRÍTICO] Error en el gestor del pool: {e}. Reintentando en 30s.")
@@ -184,24 +211,54 @@ async def chat_id_pool_manager(client: httpx.AsyncClient, queue: asyncio.Queue):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    client = httpx.AsyncClient(timeout=60.0, http2=True, headers=QWEN_HEADERS)
+    """Gestiona los recursos de la aplicación, usando Redis para la persistencia."""
+    client = httpx.AsyncClient(timeout=60.0, http2=True)
     chat_id_queue = asyncio.Queue(maxsize=MAX_CHAT_ID_POOL_SIZE)
+
+    # --- INICIO: Cargar el estado desde Redis ---
+    if redis_client:
+        try:
+            ids_from_redis = redis_client.lrange(REDIS_POOL_KEY, 0, -1)
+            if ids_from_redis:
+                print(f"Cargando {len(ids_from_redis)} Chat IDs desde el estado persistente de Redis...")
+                for chat_id in ids_from_redis:
+                    if not chat_id_queue.full():
+                        await chat_id_queue.put(chat_id)
+        except Exception as e:
+            print(f"[WARN] No se pudo cargar el pool desde Redis ({e}). Se iniciará un pool vacío.")
+    
     app_state.update({"http_client": client, "chat_id_queue": chat_id_queue})
-    print("Cliente HTTPX y cola de Chat IDs inicializados.")
     pool_task = asyncio.create_task(chat_id_pool_manager(client, chat_id_queue))
-    app_state["pool_task"] = pool_task
+    
+    print("✅ Aplicación iniciada y lista para recibir peticiones.")
     yield
-    print("Iniciando apagado de la aplicación...")
+    
+    # --- APAGADO: Guardar el estado en Redis ---
+    print("Iniciando apagado... Guardando estado del pool en Redis.")
     pool_task.cancel()
     try:
         await pool_task
-    except asyncio.CancelledError: pass
+    except asyncio.CancelledError:
+        pass
+
+    if redis_client and not chat_id_queue.empty():
+        ids_to_save = list(chat_id_queue.queue)
+        try:
+            # Usamos una transacción (pipeline) para una operación atómica
+            pipe = redis_client.pipeline()
+            pipe.delete(REDIS_POOL_KEY)
+            if ids_to_save:
+                pipe.rpush(REDIS_POOL_KEY, *ids_to_save)
+            pipe.execute()
+            print(f"Guardados {len(ids_to_save)} Chat IDs en Redis para el próximo reinicio.")
+        except Exception as e:
+            print(f"[ERROR] No se pudo guardar el estado del pool en Redis: {e}")
+
     await client.aclose()
     print("Recursos liberados. Apagado completo.")
 
 def get_http_client() -> httpx.AsyncClient: return app_state["http_client"]
 def get_chat_id_queue() -> asyncio.Queue: return app_state["chat_id_queue"]
-
 async def get_chat_id_from_pool(
     client: httpx.AsyncClient = Depends(get_http_client),
     queue: asyncio.Queue = Depends(get_chat_id_queue)
@@ -246,3 +303,4 @@ async def chat_completions_endpoint(
 @app.get("/", summary="Estado del Servicio")
 def read_root():
     return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
