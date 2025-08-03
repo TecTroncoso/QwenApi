@@ -11,6 +11,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import base64
 
 # --- Intenta usar orjson para un parseo JSON más rápido ---
 try:
@@ -303,6 +304,7 @@ async def chat_completions_endpoint(
 @app.get("/", summary="Estado del Servicio")
 def read_root():
     return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
 
 
 
