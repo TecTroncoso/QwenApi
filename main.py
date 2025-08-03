@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import List, Dict, Any, AsyncGenerator
 import redis
 import httpx
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -175,42 +175,88 @@ def _format_sse_chunk(data: BaseModel) -> str:
 async def stream_qwen_to_openai_format(
     client: httpx.AsyncClient, chat_id: str, message: OpenAIMessage, requested_model: str
 ) -> AsyncGenerator[str, None]:
+    """
+    Realiza la petición de streaming a Qwen y transforma la respuesta al formato
+    de chunks de OpenAI. La primera respuesta es un chunk especial que contiene
+    el 'chat_id' para que el cliente pueda mantener el estado de la sesión.
+    """
     url = f"{QWEN_API_BASE_URL}/chat/completions?chat_id={chat_id}"
     payload = _build_qwen_completion_payload(chat_id, message)
+    
+    # Preparamos las cabeceras específicas para esta petición
     request_headers = QWEN_HEADERS.copy()
     request_headers["Referer"] = f"https://chat.qwen.ai/c/{chat_id}"
     request_headers["x-request-id"] = str(uuid.uuid4())
+
+    # Generamos un ID de completion para los chunks y el timestamp de creación
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     created_timestamp = int(time.time())
+
+    # --- INICIO DE LA MODIFICACIÓN ---
+    # Enviamos un primer chunk "falso" que solo contiene el ID de la conversación.
+    # Usamos el campo 'id' del chunk de OpenAI para pasar nuestro 'chat_id'.
+    # Este campo normalmente se usa para el completion_id, pero lo reutilizamos
+    # aquí para la primera respuesta, ya que el cliente lo puede leer fácilmente.
+    initial_chunk_data = {
+        "id": chat_id, # <--- ¡AQUÍ ESTÁ LA MAGIA!
+        "object": "chat.completion.chunk",
+        "created": created_timestamp,
+        "model": requested_model,
+        "choices": []  # No enviamos contenido, solo metadatos
+    }
+    yield _format_sse_chunk(BaseModel.model_validate(initial_chunk_data))
+    # --- FIN DE LA MODIFICACIÓN ---
+
     try:
-        async with client.stream("POST", url, json=payload, headers=request_headers) as response:
+        async with client.stream("POST", url, json=payload, headers=request_headers, timeout=60.0) as response:
             response.raise_for_status()
+            
             async for line in response.aiter_lines():
-                if not line.startswith("data:"): continue
+                if not line.startswith("data:"):
+                    continue
+                
                 line_data = line.lstrip("data: ")
-                if not line_data or line_data.strip() == "[DONE]": continue
+                if not line_data or line_data.strip() == "[DONE]":
+                    continue
+                    
                 try:
                     qwen_chunk = JSON_DESERIALIZER(line_data)
                     delta = qwen_chunk.get("choices", [{}])[0].get("delta", {})
-                    if requested_model == MODEL_QWEN_FINAL and delta.get("phase") != "answer": continue
+                    
+                    # Filtramos por modo (final vs thinking)
+                    if requested_model == MODEL_QWEN_FINAL and delta.get("phase") != "answer":
+                        continue
+                    
                     if content_chunk := delta.get("content"):
+                        # Construimos un chunk estándar en formato OpenAI
                         openai_chunk = OpenAICompletionChunk(
-                            id=completion_id, created=created_timestamp, model=requested_model,
+                            id=completion_id,
+                            created=created_timestamp,
+                            model=requested_model,
                             choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(content=content_chunk))],
                         )
                         yield _format_sse_chunk(openai_chunk)
+
                 except (json.JSONDecodeError, IndexError, KeyError, orjson.JSONDecodeError if 'orjson' in globals() else TypeError):
+                    # Ignoramos chunks malformados o que no nos interesan
                     continue
+
     except Exception as e:
         print(f"[ERROR] Excepción durante el streaming: {e}")
         error_chunk = {"error": {"message": f"Proxy streaming error: {str(e)}", "type": "proxy_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
         return
+
+    # Enviamos el chunk final de terminación
     final_chunk = OpenAICompletionChunk(
-        id=completion_id, created=created_timestamp, model=requested_model,
+        id=completion_id,
+        created=created_timestamp,
+        model=requested_model,
         choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(), finish_reason="stop")],
     )
     yield _format_sse_chunk(final_chunk)
+    
+    # Enviamos la señal de [DONE] final
     yield "data: [DONE]\n\n"
 
 # ==============================================================================
@@ -285,20 +331,29 @@ async def lifespan(app: FastAPI):
 
 def get_http_client() -> httpx.AsyncClient: return app_state["http_client"]
 def get_chat_id_queue() -> asyncio.Queue: return app_state["chat_id_queue"]
-async def get_chat_id_from_pool(
+async def get_or_create_chat_id(
+    x_chat_id: str | None = Header(None, alias="X-Chat-ID"),
     client: httpx.AsyncClient = Depends(get_http_client),
     queue: asyncio.Queue = Depends(get_chat_id_queue)
 ) -> str:
+    """
+    Lógica inteligente para gestionar la sesión de chat.
+    1. Si el cliente envía un 'X-Chat-ID' en la cabecera, lo reutiliza.
+    2. Si no, toma uno nuevo del pool para iniciar una nueva conversación.
+    """
+    if x_chat_id:
+        print(f"[SESSION] Reutilizando Chat ID existente: {x_chat_id}")
+        return x_chat_id
+    
     try:
         chat_id = queue.get_nowait()
-        print(f"[POOL] Usando Chat ID del pool. IDs restantes: {queue.qsize()}")
+        print(f"[SESSION] Usando Chat ID nuevo del pool. IDs restantes: {queue.qsize()}")
         return chat_id
     except asyncio.QueueEmpty:
-        print("[POOL-WARN] El pool de Chat IDs está vacío. Creando uno nuevo sobre la marcha.")
+        print("[SESSION-WARN] El pool de Chat IDs está vacío. Creando uno nuevo sobre la marcha.")
         chat_id = await create_qwen_chat(client)
         if chat_id: return chat_id
-        raise HTTPException(status_code=503, detail="No se pudo obtener una sesión de chat de Qwen (pool vacío y creación fallida).")
-
+        raise HTTPException(status_code=503, detail="No se pudo obtener una sesión de chat de Qwen.")
 # ==============================================================================
 # --- 5. ENDPOINTS DE LA API (FastAPI) ---
 # ==============================================================================
@@ -315,7 +370,7 @@ def list_models():
 @app.post("/v1/chat/completions", summary="Generar Completions de Chat (Latencia Optimizada)")
 async def chat_completions_endpoint(
     request: OpenAIChatCompletionRequest,
-    chat_id: str = Depends(get_chat_id_from_pool),
+    chat_id: str = Depends(get_or_create_chat_id),
     client: httpx.AsyncClient = Depends(get_http_client)
 ):
     if not request.messages:
@@ -329,6 +384,7 @@ async def chat_completions_endpoint(
 @app.get("/", summary="Estado del Servicio")
 def read_root():
     return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
 
 
 
