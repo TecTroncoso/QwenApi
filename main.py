@@ -40,29 +40,60 @@ QWEN_INTERNAL_MODEL = "qwen3-235b-a22b"
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
 
 # --- Secretos cargados desde el entorno de Koyeb ---
-QWEN_AUTH_TOKEN = os.getenv("QWEN_AUTH_TOKEN")
+QWEN_AUTH_TOKEN_FALLBACK = os.getenv("QWEN_AUTH_TOKEN")
 QWEN_COOKIES_JSON_B64 = os.getenv("QWEN_COOKIES_JSON_B64")
 UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
 
-if not QWEN_AUTH_TOKEN or not UPSTASH_REDIS_URL:
-    raise RuntimeError("Las variables de entorno QWEN_AUTH_TOKEN y UPSTASH_REDIS_URL deben estar definidas.")
+if not UPSTASH_REDIS_URL:
+    raise RuntimeError("La variable de entorno UPSTASH_REDIS_URL debe estar definida.")
+    
+# --- Variables Globales que serán pobladas por la lógica de inicio ---
+QWEN_AUTH_TOKEN = ""
+QWEN_COOKIE_STRING = ""
 
-# --- Función Auxiliar para Formatear Cookies ---
-def format_cookies_from_b64(b64_string: str | None) -> str:
-    """Decodifica un string Base64 que contiene un JSON de cookies y lo formatea
-    en un string de cabecera 'Cookie'."""
+# --- Función Auxiliar INTELIGENTE para Formatear Cookies Y EXTRAER TOKEN ---
+def process_cookies_and_extract_token(b64_string: str | None):
+    """
+    Decodifica el JSON de cookies, lo formatea en un string, y lo más importante,
+    busca y extrae el token de autorización JWT de la lista de cookies.
+    """
+    global QWEN_AUTH_TOKEN, QWEN_COOKIE_STRING
+
     if not b64_string:
-        print("[WARN] La variable de cookies no está definida. La API podría no funcionar hasta que el workflow la actualice.")
-        return ""
+        print("[WARN] La variable de cookies no está definida. Usando Auth Token de respaldo si existe.")
+        QWEN_AUTH_TOKEN = QWEN_AUTH_TOKEN_FALLBACK if QWEN_AUTH_TOKEN_FALLBACK else ""
+        QWEN_COOKIE_STRING = ""
+        return
+
     try:
         cookies_list = JSON_DESERIALIZER(base64.b64decode(b64_string))
-        return "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
+        
+        # 1. Formatear el string de cookies para el header
+        QWEN_COOKIE_STRING = "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
+
+        # 2. Buscar y extraer el token de autorización
+        found_token = ""
+        for cookie in cookies_list:
+            if cookie.get("name") == "token":
+                found_token = cookie.get("value", "")
+                break
+        
+        if found_token:
+            QWEN_AUTH_TOKEN = f"Bearer {found_token}"
+            print("✅ Token de autorización extraído exitosamente desde las cookies.")
+        else:
+            print("[WARN] No se encontró un 'token' en las cookies. Usando Auth Token de respaldo.")
+            QWEN_AUTH_TOKEN = QWEN_AUTH_TOKEN_FALLBACK if QWEN_AUTH_TOKEN_FALLBACK else ""
+
     except Exception as e:
-        print(f"[ERROR CRÍTICO] No se pudieron decodificar o formatear las cookies: {e}")
-        return ""
+        print(f"[ERROR CRÍTICO] No se pudieron procesar las cookies: {e}. Usando Auth Token de respaldo.")
+        QWEN_AUTH_TOKEN = QWEN_AUTH_TOKEN_FALLBACK if QWEN_AUTH_TOKEN_FALLBACK else ""
+        QWEN_COOKIE_STRING = ""
 
-QWEN_COOKIE_STRING = format_cookies_from_b64(QWEN_COOKIES_JSON_B64)
+# --- Ejecutamos nuestra nueva función para poblar las variables globales ---
+process_cookies_and_extract_token(QWEN_COOKIES_JSON_B64)
 
+# --- Las Cabeceras ahora usan las variables que acabamos de poblar ---
 QWEN_HEADERS = {
     "Accept": "application/json", "Accept-Language": "es-AR,es;q=0.7", "Authorization": QWEN_AUTH_TOKEN,
     "bx-v": "2.5.31", "Content-Type": "application/json; charset=UTF-8", "Cookie": QWEN_COOKIE_STRING,
@@ -71,10 +102,10 @@ QWEN_HEADERS = {
     "source": "web", "x-accel-buffering": "no",
 }
 
-MIN_CHAT_ID_POOL_SIZE = 1
-MAX_CHAT_ID_POOL_SIZE = 2
-
-REDIS_POOL_KEY = "qwen_chat_id_pool"  # Nombre de la clave en Redis
+# --- Configuración del Pool y la Persistencia en Redis ---
+MIN_CHAT_ID_POOL_SIZE = 2
+MAX_CHAT_ID_POOL_SIZE = 5
+REDIS_POOL_KEY = "qwen_chat_id_pool"
 try:
     redis_client = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
     redis_client.ping()
@@ -105,21 +136,15 @@ class OpenAICompletionChunk(BaseModel):
 # --- 3. LÓGICA DEL CLIENTE QWEN ---
 # ==============================================================================
 async def create_qwen_chat(client: httpx.AsyncClient) -> str | None:
-    """Crea una nueva sesión de chat en Qwen y devuelve su ID. Usado por el pool."""
+    """Crea una nueva sesión de chat en Qwen y devuelve su ID."""
     url = f"{QWEN_API_BASE_URL}/chats/new"
     payload = {"title": "Proxy Pool Chat", "models": [QWEN_INTERNAL_MODEL], "chat_mode": "normal", "chat_type": "t2t", "timestamp": int(time.time() * 1000)}
     try:
-        response = await client.post(url, json=payload)
+        response = await client.post(url, json=payload, headers=QWEN_HEADERS)
         response.raise_for_status()
-        
-        # --- CORRECCIÓN FINAL APLICADA AQUÍ ---
-        # response.text es una propiedad, no una corrutina. No se usa 'await'.
-        response_text = response.text
-        data = JSON_DESERIALIZER(response_text)
-
+        data = response.json()
         if data.get("success") and (chat_id := data.get("data", {}).get("id")):
             return chat_id
-        
         print(f"[WARN] La API de Qwen no devolvió un chat_id válido. Respuesta: {data}")
         return None
     except httpx.HTTPStatusError as e:
@@ -304,6 +329,7 @@ async def chat_completions_endpoint(
 @app.get("/", summary="Estado del Servicio")
 def read_root():
     return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
 
 
 
