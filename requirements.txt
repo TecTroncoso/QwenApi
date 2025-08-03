@@ -1,4 +1,7 @@
-httpx
+# requirements.txt
 fastapi
-pydantic
+uvicorn[standard]
+httpx
+orjson
 python-dotenv
+redis
