@@ -64,7 +64,7 @@ QWEN_COOKIE_STRING = format_cookies_from_b64(QWEN_COOKIES_JSON_B64)
 
 QWEN_HEADERS = {
     "Accept": "application/json", "Accept-Language": "es-AR,es;q=0.7", "Authorization": QWEN_AUTH_TOKEN,
-    "bx-v": "2.5.31", "Content-Type": "application/json; charset=UTF-8", "Cookie": QWEN_COOKIE,
+    "bx-v": "2.5.31", "Content-Type": "application/json; charset=UTF-8", "Cookie": QWEN_COOKIE_STRING,
     "Origin": "https://chat.qwen.ai", "Referer": "https://chat.qwen.ai/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
     "source": "web", "x-accel-buffering": "no",
@@ -303,4 +303,5 @@ async def chat_completions_endpoint(
 @app.get("/", summary="Estado del Servicio")
 def read_root():
     return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
 
