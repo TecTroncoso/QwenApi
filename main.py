@@ -5,7 +5,7 @@ import os
 import asyncio
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, AsyncGenerator
-
+import redis
 import httpx
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -303,5 +303,6 @@ async def chat_completions_endpoint(
 @app.get("/", summary="Estado del Servicio")
 def read_root():
     return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
 
 
