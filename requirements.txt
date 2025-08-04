@@ -1,5 +1,5 @@
 # requirements.txt
-fastapi
+fastapi[all]
 uvicorn[standard]
 httpx[http2]
 orjson
