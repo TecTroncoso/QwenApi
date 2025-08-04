@@ -32,12 +32,11 @@ except ImportError:
 # ==============================================================================
 load_dotenv()
 
-API_TITLE = "Qwen Web API Proxy (Pool + Memoria)"
-API_VERSION = "3.1.0"
+API_TITLE = "Qwen Web API Proxy (Pool con Mapeo Directo)"
+API_VERSION = "3.2.0"
 MODEL_QWEN_FINAL = "qwen-final"
 MODEL_QWEN_THINKING = "qwen-thinking"
 QWEN_INTERNAL_MODEL = "qwen3-235b-a22b"
-
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
 
 # --- Secretos y Configuración cargados desde el entorno ---
@@ -107,19 +106,19 @@ class OpenAIChatCompletionRequest(BaseModel): model: str; messages: List[OpenAIM
 class OpenAIChunkDelta(BaseModel): content: str | None = None
 class OpenAIChunkChoice(BaseModel): index: int = 0; delta: OpenAIChunkDelta; finish_reason: str | None = None
 class OpenAICompletionChunk(BaseModel): id: str; object: str = "chat.completion.chunk"; created: int; model: str; choices: List[OpenAIChunkChoice]
-class ConversationState(BaseModel): qwen_chat_id: str; last_parent_id: str | None = None
+class ConversationState(BaseModel): last_parent_id: str | None = None
 
 # ==============================================================================
 # --- 3. GESTIÓN DE ESTADO Y POOL ---
 # ==============================================================================
-def get_conversation_state(conversation_id: str) -> ConversationState | None:
-    """Obtiene el estado de una conversación desde Redis."""
-    state_json = redis_client.get(f"qwen_conv:{conversation_id}")
+def get_conversation_state(qwen_chat_id: str) -> ConversationState | None:
+    """Obtiene el estado de una conversación desde Redis usando el qwen_chat_id como clave."""
+    state_json = redis_client.get(f"qwen_conv:{qwen_chat_id}")
     return ConversationState.model_validate_json(state_json) if state_json else None
 
-def save_conversation_state(conversation_id: str, state: ConversationState):
-    """Guarda el estado de una conversación en Redis con una expiración de 24 horas."""
-    redis_client.set(f"qwen_conv:{conversation_id}", state.model_dump_json(), ex=86400)
+def save_conversation_state(qwen_chat_id: str, state: ConversationState):
+    """Guarda el estado de una conversación en Redis usando el qwen_chat_id como clave."""
+    redis_client.set(f"qwen_conv:{qwen_chat_id}", state.model_dump_json(), ex=86400) # Expira en 24h
 
 async def create_qwen_chat(client: httpx.AsyncClient) -> str | None:
     """Crea una nueva sesión de chat en Qwen para el pool."""
@@ -159,13 +158,13 @@ def _format_sse_chunk(data: BaseModel) -> str:
     return f"data: {json_str}\n\n"
 
 async def stream_qwen_to_openai_format(
-    client: httpx.AsyncClient, conversation_id: str, state: ConversationState,
+    client: httpx.AsyncClient, qwen_chat_id: str, state: ConversationState,
     message: OpenAIMessage, requested_model: str
 ) -> AsyncGenerator[str, None]:
     """Realiza el streaming y actualiza el estado de la conversación con el nuevo parent_id."""
-    url = f"{QWEN_API_BASE_URL}/chat/completions?chat_id={state.qwen_chat_id}"
-    payload = _build_qwen_completion_payload(state.qwen_chat_id, message, state.last_parent_id)
-    headers = {**QWEN_HEADERS, "Referer": f"https://chat.qwen.ai/c/{state.qwen_chat_id}", "x-request-id": str(uuid.uuid4())}
+    url = f"{QWEN_API_BASE_URL}/chat/completions?chat_id={qwen_chat_id}"
+    payload = _build_qwen_completion_payload(qwen_chat_id, message, state.last_parent_id)
+    headers = {**QWEN_HEADERS, "Referer": f"https://chat.qwen.ai/c/{qwen_chat_id}", "x-request-id": str(uuid.uuid4())}
     
     completion_id, created_ts = f"chatcmpl-{uuid.uuid4()}", int(time.time())
     new_parent_id = None
@@ -189,10 +188,9 @@ async def stream_qwen_to_openai_format(
         yield f"data: {json.dumps({'error': {'message': f'Proxy streaming error: {e}', 'type': 'proxy_error'}})}\n\n"
         return
     finally:
-        # Al finalizar el stream, guardamos el nuevo parent_id para la siguiente interacción.
         if new_parent_id:
             state.last_parent_id = new_parent_id
-            save_conversation_state(conversation_id, state)
+            save_conversation_state(qwen_chat_id, state)
     
     yield _format_sse_chunk(OpenAICompletionChunk(id=completion_id, created=created_ts, model=requested_model, choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(), finish_reason="stop")]))
     yield "data: [DONE]\n\n"
@@ -286,7 +284,7 @@ def list_models():
         {"id": MODEL_QWEN_THINKING, "object": "model", "created": int(time.time()), "owned_by": "proxy"},
     ]}
 
-@app.post("/v1/chat/completions", summary="Generar Completions con Pool y Memoria")
+@app.post("/v1/chat/completions", summary="Generar Completions con Pool y Mapeo Directo")
 async def chat_completions_endpoint(
     request: OpenAIChatCompletionRequest,
     client: httpx.AsyncClient = Depends(get_http_client),
@@ -296,30 +294,34 @@ async def chat_completions_endpoint(
         raise HTTPException(status_code=400, detail="El campo 'messages' no puede estar vacío.")
 
     response_headers = {}
-
-    # Si el cliente nos envía un ID de conversación y lo encontramos, lo usamos.
-    if x_conversation_id and (state := get_conversation_state(x_conversation_id)):
-        conversation_id = x_conversation_id
+    
+    if x_conversation_id:
+        # Conversación existente: el ID del cliente es el chat_id de Qwen.
+        qwen_chat_id = x_conversation_id
+        state = get_conversation_state(qwen_chat_id)
+        # Si por alguna razón el estado no existe en Redis, lo creamos.
+        if not state:
+            state = ConversationState(last_parent_id=None)
+            save_conversation_state(qwen_chat_id, state)
     else:
-        # Si no, es una nueva conversación. Usamos el pool para una respuesta rápida.
+        # Nueva conversación: tomamos un ID del pool.
         print("➡️  Nueva conversación detectada. Obteniendo Chat ID del pool...")
-        qwen_chat_id_from_pool = await get_chat_id_from_pool(client, app_state["chat_id_queue"])
+        qwen_chat_id = await get_chat_id_from_pool(client, app_state["chat_id_queue"])
         
-        conversation_id = f"qwen-conv-{uuid.uuid4()}"
-        state = ConversationState(qwen_chat_id=qwen_chat_id_from_pool, last_parent_id=None)
-        save_conversation_state(conversation_id, state)
+        # Creamos el estado inicial en Redis para este nuevo chat.
+        state = ConversationState(last_parent_id=None)
+        save_conversation_state(qwen_chat_id, state)
         
-        # Preparamos el nuevo ID para devolverlo al cliente en el header de la respuesta.
-        response_headers["X-Conversation-ID"] = conversation_id
-        print(f"✨ Conversación '{conversation_id}' iniciada con un Chat ID del pool.")
+        # Preparamos el ID para devolverlo al cliente en el header.
+        response_headers["X-Conversation-ID"] = qwen_chat_id
+        print(f"✨ Conversación iniciada con ID de Qwen (del pool): {qwen_chat_id}")
 
     last_message = request.messages[-1]
     generator = stream_qwen_to_openai_format(
-        client=client, conversation_id=conversation_id, state=state, 
+        client=client, qwen_chat_id=qwen_chat_id, state=state, 
         message=last_message, requested_model=request.model
     )
     
-    # Devolvemos el stream, incluyendo el header con el nuevo ID si es una nueva conversación.
     return StreamingResponse(generator, media_type="text/event-stream", headers=response_headers)
 
 @app.get("/", summary="Estado del Servicio")
