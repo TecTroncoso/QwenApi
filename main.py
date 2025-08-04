@@ -32,14 +32,14 @@ except ImportError:
 # ==============================================================================
 load_dotenv()
 
-API_TITLE = "Qwen Web API Proxy (Pool con Mapeo Directo)"
-API_VERSION = "3.2.0"
+API_TITLE = "Qwen Web API Proxy (Con Memoria Corregida)"
+API_VERSION = "3.3.0" # Versión con corrección de contexto
 MODEL_QWEN_FINAL = "qwen-final"
 MODEL_QWEN_THINKING = "qwen-thinking"
 QWEN_INTERNAL_MODEL = "qwen3-235b-a22b"
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
 
-# --- Secretos y Configuración cargados desde el entorno ---
+# --- Secretos y Configuración ---
 QWEN_AUTH_TOKEN_FALLBACK = os.getenv("QWEN_AUTH_TOKEN")
 QWEN_COOKIES_JSON_B64 = os.getenv("QWEN_COOKIES_JSON_B64")
 UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
@@ -47,13 +47,10 @@ UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
 if not UPSTASH_REDIS_URL:
     raise RuntimeError("La variable de entorno UPSTASH_REDIS_URL debe estar definida.")
 
-QWEN_AUTH_TOKEN = ""
-QWEN_COOKIE_STRING = ""
+QWEN_AUTH_TOKEN, QWEN_COOKIE_STRING = "", ""
 
+# --- Función de procesamiento de cookies (sin cambios) ---
 def process_cookies_and_extract_token(b64_string: str | None):
-    """
-    Decodifica las cookies, formatea el string y extrae el token de autorización.
-    """
     global QWEN_AUTH_TOKEN, QWEN_COOKIE_STRING
     if not b64_string:
         print("[WARN] La variable de cookies no está definida. Usando Auth Token de respaldo.")
@@ -70,7 +67,7 @@ def process_cookies_and_extract_token(b64_string: str | None):
             print("[WARN] No se encontró 'token' en las cookies. Usando Auth Token de respaldo.")
             QWEN_AUTH_TOKEN = QWEN_AUTH_TOKEN_FALLBACK or ""
     except Exception as e:
-        print(f"[ERROR CRÍTICO] No se pudieron procesar las cookies: {e}. Usando Auth Token de respaldo.")
+        print(f"[ERROR CRÍTICO] No se pudieron procesar las cookies: {e}.")
         QWEN_AUTH_TOKEN = QWEN_AUTH_TOKEN_FALLBACK or ""
         QWEN_COOKIE_STRING = ""
 
@@ -91,15 +88,12 @@ try:
 except Exception as e:
     raise RuntimeError(f"❌ ERROR CRÍTICO AL CONECTAR CON REDIS: {e}") from e
 
-# --- Configuración del Pool ---
-MIN_CHAT_ID_POOL_SIZE = 2
-MAX_CHAT_ID_POOL_SIZE = 5
+MIN_CHAT_ID_POOL_SIZE, MAX_CHAT_ID_POOL_SIZE = 2, 5
 REDIS_POOL_KEY = "qwen_chat_id_pool"
-
 app_state: Dict[str, Any] = {}
 
 # ==============================================================================
-# --- 2. MODELOS DE DATOS (Pydantic) ---
+# --- 2. MODELOS DE DATOS ---
 # ==============================================================================
 class OpenAIMessage(BaseModel): role: str; content: str
 class OpenAIChatCompletionRequest(BaseModel): model: str; messages: List[OpenAIMessage]; stream: bool = False
@@ -111,35 +105,30 @@ class ConversationState(BaseModel): last_parent_id: str | None = None
 # ==============================================================================
 # --- 3. GESTIÓN DE ESTADO Y POOL ---
 # ==============================================================================
+# (Funciones de gestión de estado y pool sin cambios)
 def get_conversation_state(qwen_chat_id: str) -> ConversationState | None:
-    """Obtiene el estado de una conversación desde Redis usando el qwen_chat_id como clave."""
     state_json = redis_client.get(f"qwen_conv:{qwen_chat_id}")
     return ConversationState.model_validate_json(state_json) if state_json else None
 
 def save_conversation_state(qwen_chat_id: str, state: ConversationState):
-    """Guarda el estado de una conversación en Redis usando el qwen_chat_id como clave."""
-    redis_client.set(f"qwen_conv:{qwen_chat_id}", state.model_dump_json(), ex=86400) # Expira en 24h
+    redis_client.set(f"qwen_conv:{qwen_chat_id}", state.model_dump_json(), ex=86400)
 
 async def create_qwen_chat(client: httpx.AsyncClient) -> str | None:
-    """Crea una nueva sesión de chat en Qwen para el pool."""
     url = f"{QWEN_API_BASE_URL}/chats/new"
     payload = {"title": "Proxy Pool Chat", "models": [QWEN_INTERNAL_MODEL], "chat_mode": "normal", "chat_type": "t2t", "timestamp": int(time.time() * 1000)}
     try:
         response = await client.post(url, json=payload, headers=QWEN_HEADERS)
         response.raise_for_status()
         data = response.json()
-        if data.get("success") and (chat_id := data.get("data", {}).get("id")):
-            return chat_id
-        return None
+        return data.get("data", {}).get("id") if data.get("success") else None
     except Exception as e:
         print(f"[ERROR] Creando chat para el pool: {e}")
         return None
 
 # ==============================================================================
-# --- 4. LÓGICA DEL CLIENTE QWEN ---
+# --- 4. LÓGICA DEL CLIENTE QWEN (CON CORRECCIÓN) ---
 # ==============================================================================
 def _build_qwen_completion_payload(chat_id: str, message: OpenAIMessage, parent_id: str | None) -> Dict[str, Any]:
-    """Construye el payload para Qwen, incluyendo el parent_id para el contexto."""
     current_timestamp = int(time.time())
     return {
         "stream": True, "incremental_output": True, "chat_id": chat_id, "chat_mode": "normal",
@@ -161,7 +150,7 @@ async def stream_qwen_to_openai_format(
     client: httpx.AsyncClient, qwen_chat_id: str, state: ConversationState,
     message: OpenAIMessage, requested_model: str
 ) -> AsyncGenerator[str, None]:
-    """Realiza el streaming y actualiza el estado de la conversación con el nuevo parent_id."""
+    
     url = f"{QWEN_API_BASE_URL}/chat/completions?chat_id={qwen_chat_id}"
     payload = _build_qwen_completion_payload(qwen_chat_id, message, state.last_parent_id)
     headers = {**QWEN_HEADERS, "Referer": f"https://chat.qwen.ai/c/{qwen_chat_id}", "x-request-id": str(uuid.uuid4())}
@@ -177,8 +166,15 @@ async def stream_qwen_to_openai_format(
                 if not line_data or line_data == "[DONE]": continue
                 try:
                     qwen_chunk = JSON_DESERIALIZER(line_data)
-                    if "message_id" in qwen_chunk: new_parent_id = qwen_chunk["message_id"]
                     delta = qwen_chunk.get("choices", [{}])[0].get("delta", {})
+
+                    # ### CAMBIO CRÍTICO Y SOLUCIÓN ###
+                    # Solo capturamos y consideramos el message_id cuando estamos
+                    # en la fase de "respuesta" (answer). Esto evita guardar el ID
+                    # de la fase de "pensamiento" y asegura el enlace correcto.
+                    if delta.get("phase") == "answer" and "message_id" in qwen_chunk:
+                        new_parent_id = qwen_chunk["message_id"]
+
                     if requested_model == MODEL_QWEN_FINAL and delta.get("phase") != "answer": continue
                     if content := delta.get("content"):
                         yield _format_sse_chunk(OpenAICompletionChunk(id=completion_id, created=created_ts, model=requested_model, choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(content=content))]))
@@ -188,9 +184,14 @@ async def stream_qwen_to_openai_format(
         yield f"data: {json.dumps({'error': {'message': f'Proxy streaming error: {e}', 'type': 'proxy_error'}})}\n\n"
         return
     finally:
+        # Si capturamos con éxito el ID de la respuesta final, lo guardamos.
         if new_parent_id:
             state.last_parent_id = new_parent_id
             save_conversation_state(qwen_chat_id, state)
+            print(f"✅ Contexto actualizado para la conversación {qwen_chat_id}.")
+        else:
+            print(f"[WARN] No se capturó un nuevo parent_id para la conversación {qwen_chat_id}. El contexto podría perderse.")
+
     
     yield _format_sse_chunk(OpenAICompletionChunk(id=completion_id, created=created_ts, model=requested_model, choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(), finish_reason="stop")]))
     yield "data: [DONE]\n\n"
@@ -198,8 +199,8 @@ async def stream_qwen_to_openai_format(
 # ==============================================================================
 # --- 5. CICLO DE VIDA Y DEPENDENCIAS ---
 # ==============================================================================
+# (Lifespan, pool manager y dependencias sin cambios)
 async def chat_id_pool_manager(client: httpx.AsyncClient, queue: asyncio.Queue):
-    """Tarea en segundo plano que mantiene el pool de Chat IDs lleno."""
     while True:
         try:
             if queue.qsize() < MIN_CHAT_ID_POOL_SIZE:
@@ -212,35 +213,29 @@ async def chat_id_pool_manager(client: httpx.AsyncClient, queue: asyncio.Queue):
             await asyncio.sleep(10)
         except asyncio.CancelledError: break
         except Exception as e:
-            print(f"[ERROR CRÍTICO] Error en el gestor del pool: {e}. Reintentando en 30s.")
+            print(f"[ERROR CRÍTICO] Gestor del pool: {e}. Reintentando en 30s.")
             await asyncio.sleep(30)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestiona los recursos de la aplicación, incluyendo la persistencia del pool en Redis."""
     client = httpx.AsyncClient(timeout=60.0, http2=True)
     queue = asyncio.Queue(maxsize=MAX_CHAT_ID_POOL_SIZE)
     app_state.update({"http_client": client, "chat_id_queue": queue})
-
-    # INICIO: Cargar el pool desde Redis para persistencia
     try:
         ids_from_redis = redis_client.lrange(REDIS_POOL_KEY, 0, -1)
         if ids_from_redis:
-            print(f"Cargando {len(ids_from_redis)} Chat IDs desde el estado persistente de Redis...")
+            print(f"Cargando {len(ids_from_redis)} Chat IDs desde Redis...")
             for chat_id in ids_from_redis:
                 if not queue.full(): await queue.put(chat_id)
-    except Exception as e: print(f"[WARN] No se pudo cargar el pool desde Redis ({e}). Se iniciará un pool vacío.")
+    except Exception as e: print(f"[WARN] No se pudo cargar pool desde Redis: {e}")
     
     pool_task = asyncio.create_task(chat_id_pool_manager(client, queue))
     print("✅ Aplicación iniciada y lista para recibir peticiones.")
     yield
-    
-    # APAGADO: Guardar el pool en Redis
-    print("Iniciando apagado... Guardando estado del pool en Redis.")
+    print("Iniciando apagado...")
     pool_task.cancel()
     try: await pool_task
     except asyncio.CancelledError: pass
-
     if not queue.empty():
         ids_to_save = list(queue.queue)
         try:
@@ -248,33 +243,26 @@ async def lifespan(app: FastAPI):
             pipe.delete(REDIS_POOL_KEY)
             if ids_to_save: pipe.rpush(REDIS_POOL_KEY, *ids_to_save)
             pipe.execute()
-            print(f"Guardados {len(ids_to_save)} Chat IDs en Redis para el próximo reinicio.")
-        except Exception as e: print(f"[ERROR] No se pudo guardar el estado del pool en Redis: {e}")
-    
+            print(f"Guardados {len(ids_to_save)} Chat IDs en Redis.")
+        except Exception as e: print(f"[ERROR] No se pudo guardar pool en Redis: {e}")
     await client.aclose()
-    print("Recursos liberados. Apagado completo.")
+    print("Recursos liberados.")
 
 def get_http_client() -> httpx.AsyncClient: return app_state["http_client"]
 def get_chat_id_queue() -> asyncio.Queue: return app_state["chat_id_queue"]
 
-async def get_chat_id_from_pool(
-    client: httpx.AsyncClient = Depends(get_http_client),
-    queue: asyncio.Queue = Depends(get_chat_id_queue)
-) -> str:
-    """Obtiene un Chat ID del pool, o crea uno sobre la marcha si está vacío."""
-    try:
-        chat_id = queue.get_nowait()
-        print(f"[POOL] Usando Chat ID del pool. IDs restantes: {queue.qsize()}")
-        return chat_id
+async def get_chat_id_from_pool(client: httpx.AsyncClient = Depends(get_http_client), queue: asyncio.Queue = Depends(get_chat_id_queue)) -> str:
+    try: return queue.get_nowait()
     except asyncio.QueueEmpty:
-        print("[POOL-WARN] El pool de Chat IDs está vacío. Creando uno nuevo sobre la marcha.")
+        print("[POOL-WARN] Pool vacío. Creando ID sobre la marcha.")
         chat_id = await create_qwen_chat(client)
         if chat_id: return chat_id
-        raise HTTPException(status_code=503, detail="No se pudo obtener una sesión de chat de Qwen (pool vacío y creación fallida).")
+        raise HTTPException(status_code=503, detail="Pool de Qwen vacío y creación sobre la marcha fallida.")
 
 # ==============================================================================
 # --- 6. ENDPOINTS DE LA API ---
 # ==============================================================================
+# (Endpoints sin cambios)
 app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
 
 @app.get("/v1/models", summary="Listar Modelos Virtuales")
@@ -284,7 +272,7 @@ def list_models():
         {"id": MODEL_QWEN_THINKING, "object": "model", "created": int(time.time()), "owned_by": "proxy"},
     ]}
 
-@app.post("/v1/chat/completions", summary="Generar Completions con Pool y Mapeo Directo")
+@app.post("/v1/chat/completions", summary="Generar Completions con Memoria Corregida")
 async def chat_completions_endpoint(
     request: OpenAIChatCompletionRequest,
     client: httpx.AsyncClient = Depends(get_http_client),
@@ -292,36 +280,25 @@ async def chat_completions_endpoint(
 ):
     if not request.messages:
         raise HTTPException(status_code=400, detail="El campo 'messages' no puede estar vacío.")
-
     response_headers = {}
-    
     if x_conversation_id:
-        # Conversación existente: el ID del cliente es el chat_id de Qwen.
         qwen_chat_id = x_conversation_id
         state = get_conversation_state(qwen_chat_id)
-        # Si por alguna razón el estado no existe en Redis, lo creamos.
         if not state:
             state = ConversationState(last_parent_id=None)
             save_conversation_state(qwen_chat_id, state)
     else:
-        # Nueva conversación: tomamos un ID del pool.
         print("➡️  Nueva conversación detectada. Obteniendo Chat ID del pool...")
         qwen_chat_id = await get_chat_id_from_pool(client, app_state["chat_id_queue"])
-        
-        # Creamos el estado inicial en Redis para este nuevo chat.
         state = ConversationState(last_parent_id=None)
         save_conversation_state(qwen_chat_id, state)
-        
-        # Preparamos el ID para devolverlo al cliente en el header.
         response_headers["X-Conversation-ID"] = qwen_chat_id
         print(f"✨ Conversación iniciada con ID de Qwen (del pool): {qwen_chat_id}")
-
     last_message = request.messages[-1]
     generator = stream_qwen_to_openai_format(
         client=client, qwen_chat_id=qwen_chat_id, state=state, 
         message=last_message, requested_model=request.model
     )
-    
     return StreamingResponse(generator, media_type="text/event-stream", headers=response_headers)
 
 @app.get("/", summary="Estado del Servicio")
