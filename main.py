@@ -28,8 +28,8 @@ except ImportError:
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
 # ==============================================================================
 load_dotenv()
-API_TITLE = "Qwen Web API Proxy (Memoria Definitiva)"
-API_VERSION = "3.4.0" # Versión con lógica de captura de estado
+API_TITLE = "Qwen Web API Proxy (Payload Fiel)"
+API_VERSION = "3.5.0" # Versión con payload corregido según cURL
 MODEL_QWEN_FINAL, MODEL_QWEN_THINKING = "qwen-final", "qwen-thinking"
 QWEN_INTERNAL_MODEL = "qwen3-235b-a22b"
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
@@ -112,11 +112,43 @@ async def create_qwen_chat(client: httpx.AsyncClient) -> str | None:
         return None
 
 # ==============================================================================
-# --- 4. LÓGICA DEL CLIENTE QWEN (LÓGICA DE CAPTURA CORREGIDA) ---
+# --- 4. LÓGICA DEL CLIENTE QWEN (PAYLOAD Y PARSEO CORREGIDOS) ---
 # ==============================================================================
 def _build_qwen_completion_payload(chat_id: str, message: OpenAIMessage, parent_id: str | None) -> Dict[str, Any]:
+    """
+    Construye un payload que replica fielmente el formato enviado por la web de Qwen,
+    incluyendo el parent_id tanto a nivel raíz como dentro del objeto de mensaje.
+    """
     current_timestamp = int(time.time())
-    return {"stream": True, "incremental_output": True, "chat_id": chat_id, "chat_mode": "normal", "model": QWEN_INTERNAL_MODEL, "parent_id": parent_id, "messages": [{"fid": str(uuid.uuid4()), "parentId": parent_id, "role": message.role, "content": message.content, "user_action": "chat", "files": [], "timestamp": current_timestamp, "models": [QWEN_INTERNAL_MODEL], "chat_type": "t2t", "feature_config": {"thinking_enabled": True, "output_schema": "phase", "thinking_budget": 81920}, "extra": {"meta": {"subChatType": "t2t"}}, "sub_chat_type": "t2t"}], "timestamp": current_timestamp}
+    user_message_fid = str(uuid.uuid4())
+    
+    return {
+        "stream": True,
+        "incremental_output": True,
+        "chat_id": chat_id,
+        "chat_mode": "normal",
+        "model": QWEN_INTERNAL_MODEL,
+        "parent_id": parent_id,
+        "messages": [{
+            "fid": user_message_fid,
+            "parentId": parent_id,
+            "role": message.role,
+            "content": message.content,
+            "user_action": "chat",
+            "files": [],
+            "timestamp": current_timestamp,
+            "models": [QWEN_INTERNAL_MODEL],
+            "chat_type": "t2t",
+            "feature_config": {
+                "thinking_enabled": True,
+                "output_schema": "phase",
+                "thinking_budget": 81920
+            },
+            "extra": {"meta": {"subChatType": "t2t"}},
+            "sub_chat_type": "t2t",
+        }],
+        "timestamp": current_timestamp,
+    }
 
 def _format_sse_chunk(data: BaseModel) -> str:
     json_str = JSON_SERIALIZER(data.model_dump(exclude_unset=True), default=str)
@@ -244,7 +276,7 @@ def list_models():
         {"id": MODEL_QWEN_THINKING, "object": "model", "created": int(time.time()), "owned_by": "proxy"},
     ]}
 
-@app.post("/v1/chat/completions", summary="Generar Completions con Memoria Definitiva")
+@app.post("/v1/chat/completions", summary="Generar Completions con Payload Fiel")
 async def chat_completions_endpoint(request: OpenAIChatCompletionRequest, client: httpx.AsyncClient = Depends(get_http_client), x_conversation_id: str | None = Header(None, alias="X-Conversation-ID")):
     if not request.messages: raise HTTPException(status_code=400, detail="El campo 'messages' no puede estar vacío.")
     response_headers = {}
