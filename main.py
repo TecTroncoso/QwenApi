@@ -5,7 +5,7 @@ import json
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from typing import List, Dict, Any, AsyncGenerator, Union # [CORRECCIÓN FINAL] Añadir Union
+from typing import List, Dict, Any, AsyncGenerator, Union
 import redis
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
@@ -29,7 +29,7 @@ except ImportError:
 # ==============================================================================
 load_dotenv()
 API_TITLE = "Qwen Web API Proxy (Versión Final Robusta)"
-API_VERSION = "6.0.0" # Versión con manejo de contenido complejo
+API_VERSION = "6.1.0" # Versión con corrección de memoria de contexto
 MODEL_QWEN_FINAL, MODEL_QWEN_THINKING = "qwen-final", "qwen-thinking"
 QWEN_INTERNAL_MODEL = "qwen3-235b-a22b"
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
@@ -63,7 +63,7 @@ MIN_CHAT_ID_POOL_SIZE, MAX_CHAT_ID_POOL_SIZE = 2, 5; REDIS_POOL_KEY = "qwen_chat
 # ==============================================================================
 class OpenAIMessage(BaseModel):
     role: str
-    content: str # Aunque el contenido de entrada puede ser complejo, internamente lo manejaremos como string.
+    content: str
 
 # --- Modelos para Streaming ---
 class OpenAIChunkDelta(BaseModel): content: str | None = None; role: str | None = None
@@ -78,7 +78,7 @@ class OpenAIChatCompletion(BaseModel): id: str; object: str = "chat.completion";
 class ConversationState(BaseModel): last_parent_id: str | None = None
 
 # ==============================================================================
-# --- 3. GESTIÓN DE ESTADO Y POOL (Sin cambios) ---
+# --- 3. GESTIÓN DE ESTADO Y POOL ---
 # ==============================================================================
 def get_conversation_state(qwen_chat_id: str) -> ConversationState | None:
     state_json = redis_client.get(f"qwen_conv:{qwen_chat_id}"); return ConversationState.model_validate_json(state_json) if state_json else None
@@ -96,7 +96,6 @@ async def create_qwen_chat(client: httpx.AsyncClient) -> str | None:
 # ==============================================================================
 def _build_qwen_completion_payload(chat_id: str, message: OpenAIMessage, parent_id: str | None) -> Dict[str, Any]:
     current_timestamp = int(time.time()); user_message_fid = str(uuid.uuid4())
-    # El contenido aquí ya es un string simple
     return {"stream": True, "incremental_output": True, "chat_id": chat_id, "chat_mode": "normal", "model": QWEN_INTERNAL_MODEL, "parent_id": parent_id, "messages": [{"fid": user_message_fid, "parentId": parent_id, "role": message.role, "content": message.content, "user_action": "chat", "files": [], "timestamp": current_timestamp, "models": [QWEN_INTERNAL_MODEL], "chat_type": "t2t", "feature_config": {"thinking_enabled": True, "output_schema": "phase", "thinking_budget": 81920}, "extra": {"meta": {"subChatType": "t2t"}}, "sub_chat_type": "t2t"}], "timestamp": current_timestamp}
 
 async def _iterate_qwen_events(
@@ -171,7 +170,7 @@ async def generate_non_streaming_response(
     return response
 
 # ==============================================================================
-# --- 5. CICLO DE VIDA Y DEPENDENCIAS (Sin cambios) ---
+# --- 5. CICLO DE VIDA Y DEPENDENCIAS ---
 # ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -225,7 +224,6 @@ async def get_chat_id_from_pool(client: httpx.AsyncClient = Depends(get_http_cli
 # ==============================================================================
 app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
 
-# [CORRECCIÓN FINAL] Nueva función para manejar el formato de contenido
 def _normalize_and_extract_content(message: Dict[str, Any]) -> str:
     """
     Normaliza el campo 'content' de un mensaje para que siempre sea un string.
@@ -235,10 +233,8 @@ def _normalize_and_extract_content(message: Dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        # Concatenar el texto de todas las partes de tipo 'text'
         text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
         return "\n".join(text_parts)
-    # Si el contenido no es ni string ni lista, o está vacío
     raise ValueError("El formato del contenido del mensaje es inválido o no es de tipo texto.")
 
 @app.get("/v1/models", summary="Listar Modelos Virtuales")
@@ -265,36 +261,54 @@ async def chat_completions_endpoint(
     state = None
     if qwen_chat_id:
         state = get_conversation_state(qwen_chat_id)
-        if not state:
-            print(f"⚠️  Advertencia: No se encontró estado para {qwen_chat_id}. Se creará y guardará uno nuevo (contexto reiniciado).")
-            state = ConversationState(last_parent_id=None)
-            save_conversation_state(qwen_chat_id, state) # <-- AÑADIR ESTA LÍNEA
+        if not state: state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state)
     else:
         print("➡️  Nueva conversación detectada. Obteniendo Chat ID del pool...")
         qwen_chat_id = await get_chat_id_from_pool(client, app_state["chat_id_queue"])
-        state = ConversationState(last_parent_id=None)
-        save_conversation_state(qwen_chat_id, state)
-        response_headers["X-Conversation-ID"] = qwen_chat_id
+        state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state); response_headers["X-Conversation-ID"] = qwen_chat_id
         print(f"✨ Conversación iniciada con ID de Qwen (del pool): {qwen_chat_id}")
 
-    # [CORRECCIÓN FINAL] Usar la función de normalización
+    ### INICIO DE LA CORRECCIÓN ###
+    # En lugar de tomar solo el último mensaje, procesamos todo el historial
+    # para mantener el contexto, como esperan los clientes estándar de OpenAI.
     try:
-        last_message_dict = messages[-1]
-        content_str = _normalize_and_extract_content(last_message_dict)
-        role = last_message_dict.get("role", "user") # Obtener el rol de forma segura
-        last_message = OpenAIMessage(role=role, content=content_str)
+        full_prompt_parts = []
+        # 1. Iteramos sobre TODOS los mensajes enviados por el cliente.
+        for msg in messages:
+            # 2. Normalizamos el contenido de CADA mensaje.
+            content_str = _normalize_and_extract_content(msg)
+            role = msg.get("role", "user")
+            # 3. Formateamos cada mensaje para que el LLM entienda la estructura.
+            full_prompt_parts.append(f"{role}: {content_str}")
+
+        if not full_prompt_parts:
+            raise ValueError("La lista de mensajes procesada está vacía.")
+
+        # 4. Combinamos todo en un único prompt.
+        final_prompt_content = "\n\n".join(full_prompt_parts)
+        
+        # 5. Creamos el objeto OpenAIMessage que se enviará a Qwen.
+        # El rol es 'user' ya que representa el turno completo del usuario.
+        final_message_to_send = OpenAIMessage(role="user", content=final_prompt_content)
+
     except (ValueError, IndexError) as e:
-        raise HTTPException(status_code=400, detail=f"Error procesando el último mensaje: {e}")
+        raise HTTPException(status_code=400, detail=f"Error procesando el historial de mensajes: {e}")
+    ### FIN DE LA CORRECCIÓN ###
 
     if is_stream:
         print("⚡️ Petición de Streaming recibida.")
-        generator = stream_qwen_to_openai_format(client=client, qwen_chat_id=qwen_chat_id, state=state, message=last_message, requested_model=requested_model)
+        generator = stream_qwen_to_openai_format(
+            client=client, qwen_chat_id=qwen_chat_id, state=state, 
+            message=final_message_to_send, requested_model=requested_model
+        )
         return StreamingResponse(generator, media_type="text/event-stream", headers=response_headers)
     else:
         print("📦 Petición No-Streaming recibida.")
-        full_response = await generate_non_streaming_response(client=client, qwen_chat_id=qwen_chat_id, state=state, message=last_message, requested_model=requested_model)
+        full_response = await generate_non_streaming_response(
+            client=client, qwen_chat_id=qwen_chat_id, state=state, 
+            message=final_message_to_send, requested_model=requested_model
+        )
         return JSONResponse(content=full_response.model_dump(), headers=response_headers)
 
 @app.get("/", summary="Estado del Servicio")
 def read_root(): return {"status": "OK", "message": f"{API_TITLE} está activo."}
-
