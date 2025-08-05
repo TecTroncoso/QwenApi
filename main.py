@@ -9,7 +9,7 @@ from typing import List, Dict, Any, AsyncGenerator
 import redis
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import base64
@@ -28,8 +28,8 @@ except ImportError:
 # --- 1. CONFIGURACIÓN Y CONSTANTES ---
 # ==============================================================================
 load_dotenv()
-API_TITLE = "Qwen Web API Proxy (Captura de Evento Inicial)"
-API_VERSION = "3.6.0" # Versión con corrección final de captura de parent_id
+API_TITLE = "Qwen Web API Proxy (Compatible con Copilot)"
+API_VERSION = "4.0.0" # [MODIFICADO] Versión con compatibilidad no-streaming
 MODEL_QWEN_FINAL, MODEL_QWEN_THINKING = "qwen-final", "qwen-thinking"
 QWEN_INTERNAL_MODEL = "qwen3-235b-a22b"
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
@@ -63,9 +63,17 @@ MIN_CHAT_ID_POOL_SIZE, MAX_CHAT_ID_POOL_SIZE = 2, 5; REDIS_POOL_KEY = "qwen_chat
 # ==============================================================================
 class OpenAIMessage(BaseModel): role: str; content: str
 class OpenAIChatCompletionRequest(BaseModel): model: str; messages: List[OpenAIMessage]; stream: bool = False
-class OpenAIChunkDelta(BaseModel): content: str | None = None
+
+# --- Modelos para Streaming ---
+class OpenAIChunkDelta(BaseModel): content: str | None = None; role: str | None = None
 class OpenAIChunkChoice(BaseModel): index: int = 0; delta: OpenAIChunkDelta; finish_reason: str | None = None
 class OpenAICompletionChunk(BaseModel): id: str; object: str = "chat.completion.chunk"; created: int; model: str; choices: List[OpenAIChunkChoice]
+
+# --- [MODIFICADO] Modelos para respuesta No-Streaming ---
+class OpenAIResponseChoice(BaseModel): index: int = 0; message: OpenAIMessage; finish_reason: str = "stop"
+class OpenAIUsage(BaseModel): prompt_tokens: int = 0; completion_tokens: int = 0; total_tokens: int = 0
+class OpenAIChatCompletion(BaseModel): id: str; object: str = "chat.completion"; created: int; model: str; choices: List[OpenAIResponseChoice]; usage: OpenAIUsage
+
 class ConversationState(BaseModel): last_parent_id: str | None = None
 
 # ==============================================================================
@@ -83,7 +91,7 @@ async def create_qwen_chat(client: httpx.AsyncClient) -> str | None:
     except Exception as e: print(f"[ERROR] Creando chat para el pool: {e}"); return None
 
 # ==============================================================================
-# --- 4. LÓGICA DEL CLIENTE QWEN (LÓGICA DE CAPTURA FINAL) ---
+# --- 4. LÓGICA DEL CLIENTE QWEN ---
 # ==============================================================================
 def _build_qwen_completion_payload(chat_id: str, message: OpenAIMessage, parent_id: str | None) -> Dict[str, Any]:
     current_timestamp = int(time.time()); user_message_fid = str(uuid.uuid4())
@@ -92,85 +100,123 @@ def _build_qwen_completion_payload(chat_id: str, message: OpenAIMessage, parent_
 def _format_sse_chunk(data: BaseModel) -> str:
     json_str = JSON_SERIALIZER(data.model_dump(exclude_unset=True), default=str); return f"data: {json_str}\n\n"
 
+async def _iterate_qwen_events(
+    client: httpx.AsyncClient, qwen_chat_id: str, payload: Dict[str, Any]
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """[MODIFICADO] Generador base que procesa el stream de Qwen y produce eventos JSON."""
+    url = f"{QWEN_API_BASE_URL}/chat/completions?chat_id={qwen_chat_id}"
+    headers = {**QWEN_HEADERS, "Referer": f"https://chat.qwen.ai/c/{qwen_chat_id}", "x-request-id": str(uuid.uuid4())}
+    try:
+        async with client.stream("POST", url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"): continue
+                line_data = line.lstrip("data: ").strip()
+                if not line_data or line_data == "[DONE]": continue
+                try:
+                    yield JSON_DESERIALIZER(line_data)
+                except (json.JSONDecodeError, orjson.JSONDecodeError if 'orjson' in globals() else TypeError):
+                    print(f"[WARN] No se pudo decodificar la línea del stream: {line_data}")
+    except Exception as e:
+        print(f"[ERROR] Excepción en la petición de streaming: {e}")
+        # Lanza una excepción para que el manejador superior la capture
+        raise e
+
 async def stream_qwen_to_openai_format(
     client: httpx.AsyncClient, qwen_chat_id: str, state: ConversationState,
     message: OpenAIMessage, requested_model: str
 ) -> AsyncGenerator[str, None]:
-    
-    url = f"{QWEN_API_BASE_URL}/chat/completions?chat_id={qwen_chat_id}"
+    """Generador para respuestas en formato OpenAI STREAMING."""
     payload = _build_qwen_completion_payload(qwen_chat_id, message, state.last_parent_id)
-    headers = {**QWEN_HEADERS, "Referer": f"https://chat.qwen.ai/c/{qwen_chat_id}", "x-request-id": str(uuid.uuid4())}
-    
     completion_id, created_ts = f"chatcmpl-{uuid.uuid4()}", int(time.time())
-    
-    async def stream_generator():
-        try:
-            async with client.stream("POST", url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    yield line
-        except Exception as e:
-            print(f"[ERROR] Excepción en la petición de streaming: {e}")
-            # Usar yield en un generador de errores para que el cliente lo reciba
-            yield f"data: {json.dumps({'error': {'message': f'Proxy streaming error: {e}', 'type': 'proxy_error'}})}\n\n"
+    is_first_chunk = True
 
-    line_iterator = stream_generator().__aiter__()
-    
     try:
-        first_line = await line_iterator.__anext__()
-        if first_line and first_line.startswith("data:"):
-            line_data = first_line.lstrip("data: ").strip()
+        async for qwen_event in _iterate_qwen_events(client, qwen_chat_id, payload):
+            # 1. Capturar parent_id del primer evento útil
+            if response_created := qwen_event.get("response.created"):
+                if new_parent_id := response_created.get("response_id"):
+                    state.last_parent_id = new_parent_id
+                    save_conversation_state(qwen_chat_id, state)
+                    print(f"✅ Contexto actualizado para la conversación {qwen_chat_id} con parent_id: {new_parent_id[:8]}...")
+                continue # Este evento no contiene contenido, así que pasamos al siguiente
+
+            # 2. Procesar chunks de contenido
             try:
-                initial_event = JSON_DESERIALIZER(line_data)
-                if response_created := initial_event.get("response.created"):
-                    if new_parent_id := response_created.get("response_id"):
-                        state.last_parent_id = new_parent_id
-                        save_conversation_state(qwen_chat_id, state)
-                        print(f"✅ Contexto actualizado para la conversación {qwen_chat_id} con parent_id: {new_parent_id[:8]}...")
-                else:
-                    # Si no es el evento 'response.created', procesamos la línea como un chunk normal
-                    processed_chunk = _process_standard_chunk(line_data, completion_id, created_ts, requested_model)
-                    if processed_chunk: yield processed_chunk
-            except (json.JSONDecodeError, orjson.JSONDecodeError if 'orjson' in globals() else TypeError, KeyError):
-                processed_chunk = _process_standard_chunk(line_data, completion_id, created_ts, requested_model)
-                if processed_chunk: yield processed_chunk
-        else:
-             if first_line: yield first_line + "\n\n"
-
-        async for line in line_iterator:
-            if not line.startswith("data:"): continue
-            line_data = line.lstrip("data: ").strip()
-            if not line_data or line_data == "[DONE]" or '"response.created"' in line_data: continue
-            
-            processed_chunk = _process_standard_chunk(line_data, completion_id, created_ts, requested_model)
-            if processed_chunk: yield processed_chunk
+                delta = qwen_event.get("choices", [{}])[0].get("delta", {})
+                if requested_model == MODEL_QWEN_FINAL and delta.get("phase") != "answer": continue
+                
+                content = delta.get("content")
+                if content:
+                    delta_payload = {"content": content}
+                    # [MODIFICADO] Añadir el rol 'assistant' solo en el primer chunk de contenido
+                    if is_first_chunk:
+                        delta_payload['role'] = 'assistant'
+                        is_first_chunk = False
+                        
+                    chunk = OpenAICompletionChunk(
+                        id=completion_id, created=created_ts, model=requested_model,
+                        choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(**delta_payload))]
+                    )
+                    yield _format_sse_chunk(chunk)
+            except (KeyError, IndexError):
+                continue
     
-    except StopAsyncIteration:
-        pass
     except Exception as e:
-        print(f"[ERROR] Excepción durante el procesamiento del stream: {e}")
-        yield f"data: {json.dumps({'error': {'message': f'Proxy streaming error: {e}', 'type': 'proxy_error'}})}\n\n"
+        # En caso de error en el generador base, envía un chunk de error
+        error_payload = {"error": {"message": f"Error en el proxy al contactar con el backend: {e}", "type": "proxy_error"}}
+        yield f"data: {json.dumps(error_payload)}\n\n"
 
+    # 3. Enviar chunk final y [DONE]
     yield _format_sse_chunk(OpenAICompletionChunk(id=completion_id, created=created_ts, model=requested_model, choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(), finish_reason="stop")]))
     yield "data: [DONE]\n\n"
 
-def _process_standard_chunk(line_data: str, completion_id: str, created_ts: int, requested_model: str) -> str:
+async def generate_non_streaming_response(
+    client: httpx.AsyncClient, qwen_chat_id: str, state: ConversationState,
+    message: OpenAIMessage, requested_model: str
+) -> OpenAIChatCompletion:
+    """[MODIFICADO] Función para generar una respuesta completa en formato OpenAI NO-STREAMING."""
+    payload = _build_qwen_completion_payload(qwen_chat_id, message, state.last_parent_id)
+    completion_id, created_ts = f"chatcmpl-{uuid.uuid4()}", int(time.time())
+    full_content = []
+
     try:
-        qwen_chunk = JSON_DESERIALIZER(line_data)
-        delta = qwen_chunk.get("choices", [{}])[0].get("delta", {})
+        async for qwen_event in _iterate_qwen_events(client, qwen_chat_id, payload):
+            if response_created := qwen_event.get("response.created"):
+                if new_parent_id := response_created.get("response_id"):
+                    state.last_parent_id = new_parent_id
+                    save_conversation_state(qwen_chat_id, state)
+                    print(f"✅ Contexto (no-stream) actualizado para {qwen_chat_id} con parent_id: {new_parent_id[:8]}...")
+                continue
+            
+            try:
+                delta = qwen_event.get("choices", [{}])[0].get("delta", {})
+                if requested_model == MODEL_QWEN_FINAL and delta.get("phase") != "answer": continue
+                if content := delta.get("content"):
+                    full_content.append(content)
+            except (KeyError, IndexError):
+                continue
+    except Exception as e:
+        # Si hay un error en el stream, lo lanzamos como una excepción HTTP
+        raise HTTPException(status_code=502, detail=f"Error en el proxy al contactar con el backend: {e}")
 
-        if requested_model == MODEL_QWEN_FINAL and delta.get("phase") != "answer":
-            return ""
-
-        if content := delta.get("content"):
-            chunk = OpenAICompletionChunk(
-                id=completion_id, created=created_ts, model=requested_model,
-                choices=[OpenAIChunkChoice(delta=OpenAIChunkDelta(content=content))]
+    final_text = "".join(full_content)
+    
+    # Construir la respuesta final compatible con OpenAI
+    response = OpenAIChatCompletion(
+        id=completion_id,
+        created=created_ts,
+        model=requested_model,
+        choices=[
+            OpenAIResponseChoice(
+                message=OpenAIMessage(role="assistant", content=final_text),
+                finish_reason="stop"
             )
-            return _format_sse_chunk(chunk)
-    except Exception:
-        return ""
-    return ""
+        ],
+        # Los tokens son ficticios, ya que Qwen no los proporciona
+        usage=OpenAIUsage() 
+    )
+    return response
 
 # ==============================================================================
 # --- 5. CICLO DE VIDA Y DEPENDENCIAS ---
@@ -226,18 +272,53 @@ async def get_chat_id_from_pool(client: httpx.AsyncClient = Depends(get_http_cli
 app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
 @app.get("/v1/models", summary="Listar Modelos Virtuales")
 def list_models(): return {"object": "list", "data": [{"id": MODEL_QWEN_FINAL, "object": "model", "created": int(time.time()), "owned_by": "proxy"}, {"id": MODEL_QWEN_THINKING, "object": "model", "created": int(time.time()), "owned_by": "proxy"}]}
-@app.post("/v1/chat/completions", summary="Generar Completions con Memoria Definitiva")
-async def chat_completions_endpoint(request: OpenAIChatCompletionRequest, client: httpx.AsyncClient = Depends(get_http_client), x_conversation_id: str | None = Header(None, alias="X-Conversation-ID")):
+
+@app.post("/v1/chat/completions", summary="Generar Completions (Streaming y No-Streaming)")
+async def chat_completions_endpoint(
+    request: OpenAIChatCompletionRequest, 
+    client: httpx.AsyncClient = Depends(get_http_client), 
+    x_conversation_id: str | None = Header(None, alias="X-Conversation-ID")
+):
+    """
+    [MODIFICADO] Endpoint principal que ahora gestiona ambos modos: streaming y no-streaming.
+    """
     if not request.messages: raise HTTPException(status_code=400, detail="El campo 'messages' no puede estar vacío.")
-    response_headers = {};
-    if x_conversation_id:
-        qwen_chat_id = x_conversation_id; state = get_conversation_state(qwen_chat_id)
-        if not state: state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state)
+    
+    response_headers = {}
+    qwen_chat_id = x_conversation_id
+    state = None
+    
+    if qwen_chat_id:
+        state = get_conversation_state(qwen_chat_id)
+        if not state:
+            state = ConversationState(last_parent_id=None)
+            save_conversation_state(qwen_chat_id, state)
     else:
-        print("➡️  Nueva conversación detectada. Obteniendo Chat ID del pool..."); qwen_chat_id = await get_chat_id_from_pool(client, app_state["chat_id_queue"])
-        state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state); response_headers["X-Conversation-ID"] = qwen_chat_id
+        print("➡️  Nueva conversación detectada. Obteniendo Chat ID del pool...")
+        qwen_chat_id = await get_chat_id_from_pool(client, app_state["chat_id_queue"])
+        state = ConversationState(last_parent_id=None)
+        save_conversation_state(qwen_chat_id, state)
+        response_headers["X-Conversation-ID"] = qwen_chat_id
         print(f"✨ Conversación iniciada con ID de Qwen (del pool): {qwen_chat_id}")
-    last_message = request.messages[-1]; generator = stream_qwen_to_openai_format(client=client, qwen_chat_id=qwen_chat_id, state=state, message=last_message, requested_model=request.model)
-    return StreamingResponse(generator, media_type="text/event-stream", headers=response_headers)
+
+    last_message = request.messages[-1]
+
+    # --- Lógica de bifurcación: Streaming vs No-Streaming ---
+    if request.stream:
+        print("⚡️ Petición de Streaming recibida.")
+        generator = stream_qwen_to_openai_format(
+            client=client, qwen_chat_id=qwen_chat_id, state=state, 
+            message=last_message, requested_model=request.model
+        )
+        return StreamingResponse(generator, media_type="text/event-stream", headers=response_headers)
+    else:
+        print("📦 Petición No-Streaming recibida.")
+        full_response = await generate_non_streaming_response(
+            client=client, qwen_chat_id=qwen_chat_id, state=state, 
+            message=last_message, requested_model=request.model
+        )
+        # Usar JSONResponse para asegurar que las cabeceras se envían correctamente
+        return JSONResponse(content=full_response.model_dump(), headers=response_headers)
+
 @app.get("/", summary="Estado del Servicio")
 def read_root(): return {"status": "OK", "message": f"{API_TITLE} está activo."}
