@@ -303,16 +303,21 @@ async def chat_completions_endpoint(
         print(f"✨ Conversación iniciada con ID de Qwen (del pool): {qwen_chat_id}")
 
     try:
-        full_prompt_parts = []
-        for msg in messages:
-            content_str = _normalize_and_extract_content(msg)
-            role = msg.get("role", "user")
-            full_prompt_parts.append(f"{role}: {content_str}")
-        if not full_prompt_parts: raise ValueError("La lista de mensajes procesada está vacía.")
-        final_prompt_content = "\n\n".join(full_prompt_parts)
+        # Obtenemos solo el ÚLTIMO mensaje de la lista, que es el que el usuario acaba de enviar.
+        last_user_message = messages[-1]
+        
+        # Nos aseguramos de que el último mensaje sea del usuario, como debería ser.
+        if last_user_message.get("role") != "user":
+            raise ValueError("El último mensaje del historial debe tener el rol 'user'.")
+            
+        # Extraemos el contenido de ese último mensaje.
+        final_prompt_content = _normalize_and_extract_content(last_user_message)
+        
+        # Creamos el mensaje final para enviar a Qwen. Solo este mensaje.
         final_message_to_send = OpenAIMessage(role="user", content=final_prompt_content)
-    except (ValueError, IndexError) as e:
-        raise HTTPException(status_code=400, detail=f"Error procesando el historial de mensajes: {e}")
+
+    except (ValueError, IndexError, KeyError) as e:
+        raise HTTPException(status_code=400, detail=f"Error procesando el último mensaje: {e}")
 
     if is_stream:
         print(f"⚡️ Petición de Streaming para el modelo '{requested_model}' recibida.")
@@ -331,3 +336,4 @@ async def chat_completions_endpoint(
 
 @app.get("/", summary="Estado del Servicio")
 def read_root(): return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
