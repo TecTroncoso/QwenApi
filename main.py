@@ -4,6 +4,7 @@ import uuid
 import json
 import os
 import asyncio
+import hashlib  # Importación para el hash de la conversación
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, AsyncGenerator, Union
 import redis
@@ -12,7 +13,6 @@ from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import base64
 
 # --- Intenta usar orjson para un parseo JSON más rápido ---
 try:
@@ -29,14 +29,9 @@ except ImportError:
 # ==============================================================================
 load_dotenv()
 API_TITLE = "Qwen Web API Proxy (con Mapeo de Modelos)"
-API_VERSION = "7.0.0"
+API_VERSION = "8.0.0" # Versión actualizada con corrección de memoria
 
 # ### INICIO DE LA CONFIGURACIÓN DE MODELOS ###
-# Define aquí todos los modelos que quieres ofrecer a través de tu API.
-# La clave es el nombre que tus usuarios verán (ej: "qwen-coder").
-# - internal_model_id: El nombre exacto que espera la API de Qwen.
-# - filter_phase: True si solo quieres la respuesta final (fase "answer").
-#                 False si quieres ver el proceso de pensamiento (fase "thinking", etc.).
 MODEL_CONFIG = {
     "qwen-final": {
         "internal_model_id": "qwen3-235b-a22b",
@@ -48,7 +43,7 @@ MODEL_CONFIG = {
     },
     "qwen-coder-plus": {
         "internal_model_id": "qwen3-coder-plus",
-        "filter_phase": True  # Los modelos de código suelen ser directos, no necesitan "thinking"
+        "filter_phase": True
     },
     "qwen-coder-30b": {
         "internal_model_id": "qwen3-coder-30b-a3b-instruct",
@@ -105,7 +100,7 @@ class ConversationState(BaseModel): last_parent_id: str | None = None
 def get_conversation_state(qwen_chat_id: str) -> ConversationState | None:
     state_json = redis_client.get(f"qwen_conv:{qwen_chat_id}"); return ConversationState.model_validate_json(state_json) if state_json else None
 def save_conversation_state(qwen_chat_id: str, state: ConversationState):
-    redis_client.set(f"qwen_conv:{qwen_chat_id}", state.model_dump_json(), ex=86400)
+    redis_client.set(f"qwen_conv:{qwen_chat_id}", state.model_dump_json(), ex=86400) # 1 día de vida para el estado
 async def create_qwen_chat(client: httpx.AsyncClient, internal_model_id: str) -> str | None:
     url = f"{QWEN_API_BASE_URL}/chats/new"; payload = {"title": "Proxy Pool Chat", "models": [internal_model_id], "chat_mode": "normal", "chat_type": "t2t", "timestamp": int(time.time() * 1000)}
     try:
@@ -150,7 +145,7 @@ async def stream_qwen_to_openai_format(
             if response_created := qwen_event.get("response.created"):
                 if new_parent_id := response_created.get("response_id"):
                     state.last_parent_id = new_parent_id; save_conversation_state(qwen_chat_id, state)
-                    print(f"✅ Contexto actualizado para la conversación {qwen_chat_id} con parent_id: {new_parent_id[:8]}...")
+                    print(f"✅ Contexto actualizado para la conversación {qwen_chat_id[:8]} con parent_id: {new_parent_id[:8]}...")
                 continue
             try:
                 delta = qwen_event.get("choices", [{}])[0].get("delta", {})
@@ -179,7 +174,7 @@ async def generate_non_streaming_response(
             if response_created := qwen_event.get("response.created"):
                 if new_parent_id := response_created.get("response_id"):
                     state.last_parent_id = new_parent_id; save_conversation_state(qwen_chat_id, state)
-                    print(f"✅ Contexto (no-stream) actualizado para {qwen_chat_id} con parent_id: {new_parent_id[:8]}...")
+                    print(f"✅ Contexto (no-stream) actualizado para {qwen_chat_id[:8]} con parent_id: {new_parent_id[:8]}...")
                 continue
             try:
                 delta = qwen_event.get("choices", [{}])[0].get("delta", {})
@@ -202,7 +197,6 @@ async def lifespan(app: FastAPI):
         ids_from_redis = redis_client.lrange(REDIS_POOL_KEY, 0, -1)
         if ids_from_redis: print(f"Cargando {len(ids_from_redis)} Chat IDs desde Redis..."); [await queue.put(chat_id) for chat_id in ids_from_redis if not queue.full()]
     except Exception as e: print(f"[WARN] No se pudo cargar pool desde Redis: {e}")
-    # Usamos un modelo por defecto para llenar el pool, el primero de la config.
     default_internal_model = next(iter(MODEL_CONFIG.values()))["internal_model_id"]
     pool_task = asyncio.create_task(chat_id_pool_manager(client, queue, default_internal_model)); print("✅ Aplicación iniciada y lista para recibir peticiones.")
     yield
@@ -244,7 +238,7 @@ async def get_chat_id_from_pool(client: httpx.AsyncClient, queue: asyncio.Queue,
         raise HTTPException(status_code=503, detail="Pool de Qwen vacío y creación sobre la marcha fallida.")
 
 # ==============================================================================
-# --- 6. ENDPOINTS DE LA API ---
+# --- 6. ENDPOINTS Y LÓGICA DE CONVERSACIÓN ---
 # ==============================================================================
 app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
 
@@ -256,9 +250,44 @@ def _normalize_and_extract_content(message: Dict[str, Any]) -> str:
         return "\n".join(text_parts)
     raise ValueError("El formato del contenido del mensaje es inválido o no es de tipo texto.")
 
+async def get_or_create_conversation_id(
+    messages: List[Dict[str, Any]],
+    client: httpx.AsyncClient,
+    queue: asyncio.Queue,
+    internal_model_id: str
+) -> tuple[str, ConversationState]:
+    """
+    Identifica una conversación basada en el hash de su primer mensaje.
+    Si es nueva, crea un nuevo chat en Qwen y lo asocia con el hash.
+    Devuelve el ID de chat de Qwen y el estado de la conversación.
+    """
+    if not messages or "content" not in messages[0]:
+        raise ValueError("La lista de mensajes está vacía o el primer mensaje no tiene contenido.")
+
+    first_message_content = _normalize_and_extract_content(messages[0])
+    conversation_hash = hashlib.sha256(first_message_content.encode('utf-8')).hexdigest()
+    redis_key = f"conv_hash:{conversation_hash}"
+    qwen_chat_id = redis_client.get(redis_key)
+
+    if qwen_chat_id:
+        print(f"➡️  Conversación existente reconocida (hash: {conversation_hash[:8]}). ID: {qwen_chat_id[:8]}...")
+        state = get_conversation_state(qwen_chat_id)
+        if not state:
+            print(f"[WARN] Estado no encontrado para Conv ID {qwen_chat_id[:8]}. Reinicializando estado.")
+            state = ConversationState(last_parent_id=None)
+            save_conversation_state(qwen_chat_id, state)
+        return qwen_chat_id, state
+    else:
+        print(f"✨ Nueva conversación detectada (hash: {conversation_hash[:8]}). Obteniendo ID del pool...")
+        new_qwen_chat_id = await get_chat_id_from_pool(client, queue, internal_model_id)
+        redis_client.set(redis_key, new_qwen_chat_id, ex=86400 * 7) # Expira en 7 días
+        new_state = ConversationState(last_parent_id=None)
+        save_conversation_state(new_qwen_chat_id, new_state)
+        print(f"✅ Conversación asociada: hash {conversation_hash[:8]} -> Qwen ID {new_qwen_chat_id[:8]}")
+        return new_qwen_chat_id, new_state
+
 @app.get("/v1/models", summary="Listar Modelos Virtuales")
 def list_models():
-    """Genera dinámicamente la lista de modelos desde MODEL_CONFIG."""
     data = [
         {"id": model_name, "object": "model", "created": int(time.time()), "owned_by": "proxy"}
         for model_name in MODEL_CONFIG.keys()
@@ -267,73 +296,66 @@ def list_models():
 
 @app.post("/v1/chat/completions", summary="Generar Completions (Streaming y No-Streaming)")
 async def chat_completions_endpoint(
-    request: Request, 
-    client: httpx.AsyncClient = Depends(get_http_client), 
-    x_conversation_id: str | None = Header(None, alias="X-Conversation-ID")
+    request: Request,
+    client: httpx.AsyncClient = Depends(get_http_client),
+    queue: asyncio.Queue = Depends(get_chat_id_queue),
 ):
-    try: request_body = await request.json()
-    except json.JSONDecodeError: raise HTTPException(status_code=400, detail="Cuerpo de la solicitud no es JSON válido.")
+    try:
+        request_body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Cuerpo de la solicitud no es JSON válido.")
 
     requested_model = request_body.get("model")
-    if not requested_model: raise HTTPException(status_code=400, detail="El campo 'model' es requerido.")
-    
-    # Validar que el modelo solicitado existe en nuestra configuración
+    if not requested_model:
+        raise HTTPException(status_code=400, detail="El campo 'model' es requerido.")
+
     model_config = MODEL_CONFIG.get(requested_model)
     if not model_config:
         raise HTTPException(
-            status_code=404, 
+            status_code=404,
             detail=f"Modelo '{requested_model}' no encontrado. Modelos disponibles: {list(MODEL_CONFIG.keys())}"
         )
-    
+
     messages = request_body.get("messages")
-    if not messages: raise HTTPException(status_code=400, detail="El campo 'messages' no puede estar vacío.")
-        
+    if not messages or not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="El campo 'messages' debe ser una lista no vacía.")
+
     is_stream = request_body.get("stream", False)
-    
-    response_headers = {}; qwen_chat_id = x_conversation_id
-    state = None
-    if qwen_chat_id:
-        state = get_conversation_state(qwen_chat_id)
-        if not state: state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state)
-    else:
-        print("➡️  Nueva conversación detectada. Obteniendo Chat ID del pool...")
-        internal_model_id = model_config["internal_model_id"]
-        qwen_chat_id = await get_chat_id_from_pool(client, app_state["chat_id_queue"], internal_model_id)
-        state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state); response_headers["X-Conversation-ID"] = qwen_chat_id
-        print(f"✨ Conversación iniciada con ID de Qwen (del pool): {qwen_chat_id}")
 
     try:
-        # Obtenemos solo el ÚLTIMO mensaje de la lista, que es el que el usuario acaba de enviar.
+        qwen_chat_id, state = await get_or_create_conversation_id(
+            messages=messages,
+            client=client,
+            queue=queue,
+            internal_model_id=model_config["internal_model_id"]
+        )
+
         last_user_message = messages[-1]
-        
-        # Nos aseguramos de que el último mensaje sea del usuario, como debería ser.
         if last_user_message.get("role") != "user":
             raise ValueError("El último mensaje del historial debe tener el rol 'user'.")
-            
-        # Extraemos el contenido de ese último mensaje.
-        final_prompt_content = _normalize_and_extract_content(last_user_message)
         
-        # Creamos el mensaje final para enviar a Qwen. Solo este mensaje.
+        final_prompt_content = _normalize_and_extract_content(last_user_message)
         final_message_to_send = OpenAIMessage(role="user", content=final_prompt_content)
 
     except (ValueError, IndexError, KeyError) as e:
-        raise HTTPException(status_code=400, detail=f"Error procesando el último mensaje: {e}")
+        raise HTTPException(status_code=400, detail=f"Error procesando los mensajes: {e}")
+
+    response_headers = {"X-Conversation-ID": qwen_chat_id} # Opcional, para depuración
 
     if is_stream:
-        print(f"⚡️ Petición de Streaming para el modelo '{requested_model}' recibida.")
+        print(f"⚡️ Petición de Streaming para '{requested_model}' en Conv ID {qwen_chat_id[:8]}...")
         generator = stream_qwen_to_openai_format(
-            client=client, qwen_chat_id=qwen_chat_id, state=state, 
+            client=client, qwen_chat_id=qwen_chat_id, state=state,
             message=final_message_to_send, requested_model=requested_model, model_config=model_config
         )
         return StreamingResponse(generator, media_type="text/event-stream", headers=response_headers)
     else:
-        print(f"📦 Petición No-Streaming para el modelo '{requested_model}' recibida.")
+        print(f"📦 Petición No-Streaming para '{requested_model}' en Conv ID {qwen_chat_id[:8]}...")
         full_response = await generate_non_streaming_response(
-            client=client, qwen_chat_id=qwen_chat_id, state=state, 
+            client=client, qwen_chat_id=qwen_chat_id, state=state,
             message=final_message_to_send, requested_model=requested_model, model_config=model_config
         )
         return JSONResponse(content=full_response.model_dump(), headers=response_headers)
 
 @app.get("/", summary="Estado del Servicio")
 def read_root(): return {"status": "OK", "message": f"{API_TITLE} está activo."}
-
