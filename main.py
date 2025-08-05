@@ -265,11 +265,16 @@ async def chat_completions_endpoint(
     state = None
     if qwen_chat_id:
         state = get_conversation_state(qwen_chat_id)
-        if not state: state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state)
+        if not state:
+            print(f"⚠️  Advertencia: No se encontró estado para {qwen_chat_id}. Se creará y guardará uno nuevo (contexto reiniciado).")
+            state = ConversationState(last_parent_id=None)
+            save_conversation_state(qwen_chat_id, state) # <-- AÑADIR ESTA LÍNEA
     else:
         print("➡️  Nueva conversación detectada. Obteniendo Chat ID del pool...")
         qwen_chat_id = await get_chat_id_from_pool(client, app_state["chat_id_queue"])
-        state = ConversationState(last_parent_id=None); save_conversation_state(qwen_chat_id, state); response_headers["X-Conversation-ID"] = qwen_chat_id
+        state = ConversationState(last_parent_id=None)
+        save_conversation_state(qwen_chat_id, state)
+        response_headers["X-Conversation-ID"] = qwen_chat_id
         print(f"✨ Conversación iniciada con ID de Qwen (del pool): {qwen_chat_id}")
 
     # [CORRECCIÓN FINAL] Usar la función de normalización
@@ -292,3 +297,4 @@ async def chat_completions_endpoint(
 
 @app.get("/", summary="Estado del Servicio")
 def read_root(): return {"status": "OK", "message": f"{API_TITLE} está activo."}
+
