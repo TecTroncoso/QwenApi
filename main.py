@@ -227,21 +227,12 @@ async def sse_stream(
     comp_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
 
-    # OPT:01 headers + pre-flight
+    # OPT:01 pre-flight flush
     yield ":\n\n"
+
     buffer = []
     last_flush = time.time()
-
-    # OPT:06 heartbeat
-    async def heartbeat():
-        while True:
-            await asyncio.sleep(HEARTBEAT_SEC)
-            try:
-                yield ":hb\n\n"
-            except Exception:
-                break
-
-    hb_task = asyncio.create_task(heartbeat())
+    last_heartbeat = time.time()
 
     try:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
@@ -252,17 +243,18 @@ async def sse_stream(
                 line = line[5:].strip()
                 if not line or line == "[DONE]":
                     continue
+
                 try:
                     ev = JSON_DESERIALIZER(line)
                 except Exception:
                     continue
 
-                # update parent_id
+                # actualizar parent_id
                 if ev.get("response.created"):
                     pid = ev["response.created"].get("response_id")
                     if pid:
                         state.last_parent_id = pid
-                        await get_or_init_state(chat_id, state)  # guarda vía lua
+                        await get_or_init_state(chat_id, state)
                     continue
 
                 delta = ev.get("choices", [{}])[0].get("delta", {})
@@ -270,25 +262,36 @@ async def sse_stream(
                     continue
                 if txt := delta.get("content"):
                     buffer.append(txt)
-                    if len(buffer) >= BATCH_TOK or time.time() - last_flush >= BATCH_MS:
-                        chunk = {
-                            "id": comp_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}],
-                        }
-                        yield f"data: {JSON_SERIALIZER(chunk)}\n\n"
-                        buffer.clear()
-                        last_flush = time.time()
+
+                # batching + heartbeat
+                now = time.time()
+                if buffer and (len(buffer) >= BATCH_TOK or now - last_flush >= BATCH_MS):
+                    chunk = {
+                        "id": comp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}],
+                    }
+                    yield f"data: {JSON_SERIALIZER(chunk)}\n\n"
+                    buffer.clear()
+                    last_flush = now
+
+                # heartbeat cada 15 s
+                if now - last_heartbeat >= 15:
+                    yield ":hb\n\n"
+                    last_heartbeat = now
+
     except Exception as e:
         yield f'data: {{"error":"{e}"}}\n\n'
+
     if buffer:
         chunk = {"id": comp_id, "object": "chat.completion.chunk", "created": created, "model": model_name, "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}]}
         yield f"data: {JSON_SERIALIZER(chunk)}\n\n"
+
     yield f'data: {JSON_SERIALIZER({"id": comp_id, "object": "chat.completion.chunk", "created": created, "model": model_name, "choices": [{"delta": {}, "finish_reason": "stop"}]})}\n\n'
     yield "data: [DONE]\n\n"
-    hb_task.cancel()
+
 
 # ==============================================================================
 # FASTAPI LIFESPAN
@@ -401,3 +404,4 @@ def root():
 
 # ==============================================================================
 # uvicorn main_ultimate:app --reload --host 0.0.0.0 --port 8000
+
