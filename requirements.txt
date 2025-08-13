@@ -6,3 +6,4 @@ orjson
 python-dotenv
 redis
 gunicorn
+xxhash
