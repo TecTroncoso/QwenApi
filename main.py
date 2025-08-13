@@ -1,4 +1,4 @@
-# main_ultimate.py  –  100 % de las 15 optimizaciones aplicadas
+# main_final.py – 100 % optimizado y sin errores de async-generator
 # ==============================================================================
 import asyncio
 import base64
@@ -7,14 +7,14 @@ import os
 import socket
 import time
 import uuid
-import xxhash  # OPT:11
+import xxhash
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 import orjson
-import redis.asyncio as redis  # OPT:03 pipeline-ready
+import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -29,8 +29,8 @@ JSON_DESERIALIZER = orjson.loads
 # CONFIG GLOBAL
 # ==============================================================================
 load_dotenv()
-API_TITLE = "Qwen Web API Proxy (ULTIMATE-LATENCY)"
-API_VERSION = "11.0.0"
+API_TITLE = "Qwen Web API Proxy (FINAL)"
+API_VERSION = "12.0.0"
 
 MODEL_CONFIG = {
     "qwen-final":     {"internal_model_id": "qwen3-235b-a22b",   "filter_phase": True},
@@ -44,7 +44,6 @@ UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
 if not UPSTASH_REDIS_URL:
     raise RuntimeError("UPSTASH_REDIS_URL no definida")
 
-# Redis con pipeline & keep-alive
 redis_client = redis.from_url(
     UPSTASH_REDIS_URL,
     decode_responses=True,
@@ -53,7 +52,6 @@ redis_client = redis.from_url(
     health_check_interval=30,
 )
 
-# Lua script GET-SET-EX atómico (OPT:03)
 LUA_GET_SET_EX = """
 local v = redis.call('GET', KEYS[1])
 if not v then
@@ -63,7 +61,7 @@ return v
 """
 
 # ==============================================================================
-# MODELOS Pydantic
+# MODELOS
 # ==============================================================================
 class OpenAIMessage(BaseModel):
     role: str
@@ -73,7 +71,7 @@ class ConversationState(BaseModel):
     last_parent_id: Optional[str] = None
 
 # ==============================================================================
-# UTILS GENERALES
+# UTILS
 # ==============================================================================
 @lru_cache(maxsize=1)
 def _cookies_and_token() -> tuple[str, str]:
@@ -87,7 +85,7 @@ def _cookies_and_token() -> tuple[str, str]:
         token = next((c["value"] for c in cookies if c["name"] == "token"), "")
         return cookie_str, f"Bearer {token}" if token else f"Bearer {fallback}"
     except Exception:
-        return "", f"Bearer {fallback}"
+        return cookie_str, f"Bearer {fallback}"
 
 @lru_cache(maxsize=1)
 def _build_headers() -> Dict[str, str]:
@@ -105,9 +103,9 @@ def _build_headers() -> Dict[str, str]:
     }
 
 # ==============================================================================
-# REDIS HELPERS CON PIPELINE / LUA
+# REDIS + LUA
 # ==============================================================================
-lua_script = None  # se registra en lifespan
+lua_script = None
 
 async def get_or_init_state(chat_id: str, state: ConversationState) -> ConversationState:
     key = f"qwen_conv:{chat_id}"
@@ -115,11 +113,11 @@ async def get_or_init_state(chat_id: str, state: ConversationState) -> Conversat
     return ConversationState.model_validate_json(data) if data else state
 
 # ==============================================================================
-# CLIENTE HTTPX ULTRA-OPTIMIZADO
+# CLIENTE HTTPX
 # ==============================================================================
 _transport = httpx.AsyncHTTPTransport(
     retries=0,
-    socket_options=[(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)],  # OPT:15
+    socket_options=[(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)],
 )
 
 client = httpx.AsyncClient(
@@ -161,7 +159,6 @@ async def pool_manager(internal_model: str):
             current = await redis_client.llen(POOL_KEY)
             if current < MIN_POOL:
                 needed = MAX_POOL - current
-                # HTTP/2 multiplex: todas las llamadas usan la misma conexión (OPT:09)
                 tasks = [create_chat(internal_model) for _ in range(needed)]
                 created = [cid for cid in await asyncio.gather(*tasks) if cid]
                 if created:
@@ -174,16 +171,14 @@ async def pool_manager(internal_model: str):
         except Exception:
             await asyncio.sleep(30)
 
-# In-memory LRU cache antes de Redis (OPT:14)
 @lru_cache(maxsize=1000)
 def _cached_hash_lookup(prompt_hash: str) -> Optional[str]:
-    # se llama desde sync lru_cache => usamos sync wrapper
     import redis
     r = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
     return r.get(f"conv_hash:{prompt_hash}")
 
 # ==============================================================================
-# SSE STREAMING 100 % OPTIMIZADO
+# CONFIG STREAMING
 # ==============================================================================
 BATCH_MS = 0.020
 BATCH_TOK = 3
@@ -227,8 +222,7 @@ async def sse_stream(
     comp_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
 
-    # OPT:01 pre-flight flush
-    yield ":\n\n"
+    yield ":\n\n"  # pre-flight flush
 
     buffer = []
     last_flush = time.time()
@@ -243,13 +237,11 @@ async def sse_stream(
                 line = line[5:].strip()
                 if not line or line == "[DONE]":
                     continue
-
                 try:
                     ev = JSON_DESERIALIZER(line)
                 except Exception:
                     continue
 
-                # actualizar parent_id
                 if ev.get("response.created"):
                     pid = ev["response.created"].get("response_id")
                     if pid:
@@ -263,7 +255,6 @@ async def sse_stream(
                 if txt := delta.get("content"):
                     buffer.append(txt)
 
-                # batching + heartbeat
                 now = time.time()
                 if buffer and (len(buffer) >= BATCH_TOK or now - last_flush >= BATCH_MS):
                     chunk = {
@@ -277,8 +268,7 @@ async def sse_stream(
                     buffer.clear()
                     last_flush = now
 
-                # heartbeat cada 15 s
-                if now - last_heartbeat >= 15:
+                if now - last_heartbeat >= HEARTBEAT_SEC:
                     yield ":hb\n\n"
                     last_heartbeat = now
 
@@ -292,21 +282,17 @@ async def sse_stream(
     yield f'data: {JSON_SERIALIZER({"id": comp_id, "object": "chat.completion.chunk", "created": created, "model": model_name, "choices": [{"delta": {}, "finish_reason": "stop"}]})}\n\n'
     yield "data: [DONE]\n\n"
 
-
 # ==============================================================================
-# FASTAPI LIFESPAN
+# FASTAPI APP
 # ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global lua_script
     lua_script = redis_client.register_script(LUA_GET_SET_EX)
-
-    # OPT:02 pre-warm TLS
     try:
         await client.head(QWEN_API_BASE_URL + "/health")
     except Exception:
-        pass  # endpoint puede no existir
-
+        pass
     mgr = asyncio.create_task(pool_manager(next(iter(MODEL_CONFIG.values()))["internal_model_id"]))
     yield
     mgr.cancel()
@@ -316,11 +302,8 @@ async def lifespan(app: FastAPI):
         pass
     await client.aclose()
 
-# ==============================================================================
-# FASTAPI APP
-# ==============================================================================
 app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
-app.add_middleware(GZipMiddleware, minimum_size=1024)  # OPT:10
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 @app.get("/v1/models")
 def list_models():
@@ -346,22 +329,18 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="Last message must be user")
 
     prompt = last_msg.get("content", "")
-    # OPT:12 thread-bound hashing (rápido pero no bloqueante)
     loop = asyncio.get_running_loop()
     prompt_hash = await loop.run_in_executor(None, xxhash.xxh64, prompt.encode())
     prompt_hash = prompt_hash.hexdigest()
 
-    # LRU antes de Redis (OPT:14)
     chat_id = _cached_hash_lookup(prompt_hash)
     if not chat_id:
-        # Back-pressure 429 (OPT:13)
         llen = await redis_client.llen(POOL_KEY)
         if llen == 0:
             raise HTTPException(status_code=429, detail="Pool empty, retry later")
         chat_id = await redis_client.lpop(POOL_KEY)
         if not chat_id:
             raise HTTPException(status_code=429, detail="Pool empty, retry later")
-        # guardar hash -> chat_id
         await redis_client.set(f"conv_hash:{prompt_hash}", chat_id, ex=86400 * 7)
 
     state = ConversationState(last_parent_id=None)
@@ -375,7 +354,6 @@ async def chat_completions(request: Request):
             headers={"X-Conversation-ID": chat_id},
         )
     else:
-        # non-stream: reutilizamos la misma lógica con buffer completo
         full = []
         async for chunk in sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]):
             if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
@@ -401,7 +379,3 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
-
-# ==============================================================================
-# uvicorn main_ultimate:app --reload --host 0.0.0.0 --port 8000
-
