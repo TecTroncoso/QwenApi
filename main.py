@@ -1,8 +1,7 @@
-# main_final.py – 100 % optimizado y sin errores de async-generator
+# main_fixed.py – Render-ready, no UnboundLocalError
 # ==============================================================================
 import asyncio
 import base64
-import json
 import os
 import socket
 import time
@@ -21,29 +20,57 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# --- SERIALIZACIÓN ULTRA-RÁPIDA ----------------------------------------------
+# ---------- SERIALIZATION ----------
 def JSON_SERIALIZER(v, *, default=str):
     return orjson.dumps(v, default=default).decode()
 
-# ==============================================================================
-# CONFIG GLOBAL
-# ==============================================================================
+JSON_DESERIALIZER = orjson.loads
+
+# ---------- GLOBAL CONFIG ----------
 load_dotenv()
-API_TITLE = "Qwen Web API Proxy (FINAL)"
-API_VERSION = "12.0.0"
+API_TITLE = "Qwen Web API Proxy (RENDER-FIXED)"
+API_VERSION = "13.0.0"
 
 MODEL_CONFIG = {
-    "qwen-final":     {"internal_model_id": "qwen3-235b-a22b",   "filter_phase": True},
-    "qwen-thinking":  {"internal_model_id": "qwen3-235b-a22b",   "filter_phase": False},
-    "qwen-coder-plus":{"internal_model_id": "qwen3-coder-plus",  "filter_phase": True},
+    "qwen-final":     {"internal_model_id": "qwen3-235b-a22b",  "filter_phase": True},
+    "qwen-thinking":  {"internal_model_id": "qwen3-235b-a22b",  "filter_phase": False},
+    "qwen-coder-plus":{"internal_model_id": "qwen3-coder-plus", "filter_phase": True},
     "qwen-coder-30b": {"internal_model_id": "qwen3-coder-30b-a3b-instruct", "filter_phase": True},
 }
 
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
 UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
 if not UPSTASH_REDIS_URL:
-    raise RuntimeError("UPSTASH_REDIS_URL no definida")
+    raise RuntimeError("UPSTASH_REDIS_URL must be set on Render")
 
+QWEN_AUTH_TOKEN_FALLBACK = os.getenv("QWEN_AUTH_TOKEN", "")
+QWEN_COOKIES_JSON_B64      = os.getenv("QWEN_COOKIES_JSON_B64", "")
+
+# ---------- COOKIES / TOKEN ----------
+QWEN_AUTH_TOKEN: str   = ""
+QWEN_COOKIE_STRING: str = ""
+
+def process_cookies_and_extract_token(b64_string: str | None):
+    global QWEN_AUTH_TOKEN, QWEN_COOKIE_STRING
+    if not b64_string:
+        print("[WARN] Cookies var not found → using fallback token")
+        QWEN_AUTH_TOKEN   = QWEN_AUTH_TOKEN_FALLBACK
+        QWEN_COOKIE_STRING = ""
+        return
+    try:
+        cookies_list = JSON_DESERIALIZER(base64.b64decode(b64_string))
+        QWEN_COOKIE_STRING = "; ".join(f"{c['name']}={c['value']}" for c in cookies_list)
+        token_value = next((c.get("value", "") for c in cookies_list if c.get("name") == "token"), "")
+        QWEN_AUTH_TOKEN = f"Bearer {token_value}" if token_value else QWEN_AUTH_TOKEN_FALLBACK
+        print("✅ Cookies & token processed OK")
+    except Exception as e:
+        print(f"[ERROR] Cookie parse: {e}")
+        QWEN_AUTH_TOKEN   = QWEN_AUTH_TOKEN_FALLBACK
+        QWEN_COOKIE_STRING = ""
+
+process_cookies_and_extract_token(QWEN_COOKIES_JSON_B64)
+
+# ---------- REDIS ----------
 redis_client = redis.from_url(
     UPSTASH_REDIS_URL,
     decode_responses=True,
@@ -51,7 +78,21 @@ redis_client = redis.from_url(
     socket_keepalive_options={},
     health_check_interval=30,
 )
+try:
+    redis_client.ping()
+    print("✅ Redis connected")
+except Exception as e:
+    raise RuntimeError(f"❌ Redis connect: {e}") from e
 
+# ---------- MODELS ----------
+class OpenAIMessage(BaseModel):
+    role: str
+    content: str
+
+class ConversationState(BaseModel):
+    last_parent_id: Optional[str] = None
+
+# ---------- UTILS ----------
 LUA_GET_SET_EX = """
 local v = redis.call('GET', KEYS[1])
 if not v then
@@ -60,41 +101,12 @@ end
 return v
 """
 
-# ==============================================================================
-# MODELOS
-# ==============================================================================
-class OpenAIMessage(BaseModel):
-    role: str
-    content: str
-
-class ConversationState(BaseModel):
-    last_parent_id: Optional[str] = None
-
-# ==============================================================================
-# UTILS
-# ==============================================================================
-@lru_cache(maxsize=1)
-def _cookies_and_token() -> tuple[str, str]:
-    b64 = os.getenv("QWEN_COOKIES_JSON_B64")
-    fallback = os.getenv("QWEN_AUTH_TOKEN", "")
-    if not b64:
-        return "", f"Bearer {fallback}"
-    try:
-        cookies = JSON_DESERIALIZER(base64.b64decode(b64))
-        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-        token = next((c["value"] for c in cookies if c["name"] == "token"), "")
-        return cookie_str, f"Bearer {token}" if token else f"Bearer {fallback}"
-    except Exception:
-        return cookie_str, f"Bearer {fallback}"
-
-@lru_cache(maxsize=1)
 def _build_headers() -> Dict[str, str]:
-    cookies, token = _cookies_and_token()
     return {
         "Accept": "application/json",
         "Content-Type": "application/json; charset=UTF-8",
-        "Authorization": token,
-        "Cookie": cookies,
+        "Authorization": QWEN_AUTH_TOKEN,
+        "Cookie": QWEN_COOKIE_STRING,
         "Origin": "https://chat.qwen.ai",
         "Referer": "https://chat.qwen.ai/",
         "User-Agent": "Mozilla/5.0",
@@ -102,24 +114,11 @@ def _build_headers() -> Dict[str, str]:
         "x-accel-buffering": "no",
     }
 
-# ==============================================================================
-# REDIS + LUA
-# ==============================================================================
-lua_script = None
-
-async def get_or_init_state(chat_id: str, state: ConversationState) -> ConversationState:
-    key = f"qwen_conv:{chat_id}"
-    data = await lua_script(keys=[key], args=[state.model_dump_json(), "86400"])
-    return ConversationState.model_validate_json(data) if data else state
-
-# ==============================================================================
-# CLIENTE HTTPX
-# ==============================================================================
+# ---------- HTTPX ----------
 _transport = httpx.AsyncHTTPTransport(
     retries=0,
     socket_options=[(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)],
 )
-
 client = httpx.AsyncClient(
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=200),
     timeout=httpx.Timeout(5.0, connect=1.0, read=15.0, write=2.0),
@@ -127,11 +126,10 @@ client = httpx.AsyncClient(
     transport=_transport,
 )
 
-# ==============================================================================
-# POOL DE CHAT IDs
-# ==============================================================================
+# ---------- POOL ----------
 MIN_POOL, MAX_POOL = 2, 5
 POOL_KEY = "qwen_chat_id_pool"
+lua_script = None   # will be set in lifespan
 
 async def create_chat(internal_model: str) -> Optional[str]:
     payload = {
@@ -142,11 +140,7 @@ async def create_chat(internal_model: str) -> Optional[str]:
         "timestamp": int(time.time() * 1000),
     }
     try:
-        r = await client.post(
-            f"{QWEN_API_BASE_URL}/chats/new",
-            json=payload,
-            headers=_build_headers(),
-        )
+        r = await client.post(f"{QWEN_API_BASE_URL}/chats/new", json=payload, headers=_build_headers())
         r.raise_for_status()
         return r.json()["data"]["id"]
     except Exception:
@@ -177,9 +171,7 @@ def _cached_hash_lookup(prompt_hash: str) -> Optional[str]:
     r = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
     return r.get(f"conv_hash:{prompt_hash}")
 
-# ==============================================================================
-# CONFIG STREAMING
-# ==============================================================================
+# ---------- STREAMING ----------
 BATCH_MS = 0.020
 BATCH_TOK = 3
 HEARTBEAT_SEC = 15
@@ -222,8 +214,7 @@ async def sse_stream(
     comp_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
 
-    yield ":\n\n"  # pre-flight flush
-
+    yield ":\n\n"
     buffer = []
     last_flush = time.time()
     last_heartbeat = time.time()
@@ -246,7 +237,10 @@ async def sse_stream(
                     pid = ev["response.created"].get("response_id")
                     if pid:
                         state.last_parent_id = pid
-                        await get_or_init_state(chat_id, state)
+                        await redis_client.register_script(LUA_GET_SET_EX)(
+                            keys=[f"qwen_conv:{chat_id}"],
+                            args=[state.model_dump_json(), "86400"]
+                        )
                     continue
 
                 delta = ev.get("choices", [{}])[0].get("delta", {})
@@ -282,9 +276,7 @@ async def sse_stream(
     yield f'data: {JSON_SERIALIZER({"id": comp_id, "object": "chat.completion.chunk", "created": created, "model": model_name, "choices": [{"delta": {}, "finish_reason": "stop"}]})}\n\n'
     yield "data: [DONE]\n\n"
 
-# ==============================================================================
-# FASTAPI APP
-# ==============================================================================
+# ---------- FASTAPI ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global lua_script
@@ -344,7 +336,9 @@ async def chat_completions(request: Request):
         await redis_client.set(f"conv_hash:{prompt_hash}", chat_id, ex=86400 * 7)
 
     state = ConversationState(last_parent_id=None)
-    state = await get_or_init_state(chat_id, state)
+    state = ConversationState.model_validate_json(
+        await redis_client.get(f"qwen_conv:{chat_id}") or "{}"
+    )
 
     is_stream = body.get("stream", False)
     if is_stream:
