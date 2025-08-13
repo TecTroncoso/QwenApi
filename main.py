@@ -22,8 +22,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # --- SERIALIZACIÓN ULTRA-RÁPIDA ----------------------------------------------
-JSON_SERIALIZER = lambda v, *, default: orjson.dumps(v, default=default).decode()
-JSON_DESERIALIZER = orjson.loads
+def JSON_SERIALIZER(v, *, default=str):
+    return orjson.dumps(v, default=default).decode()
 
 # ==============================================================================
 # CONFIG GLOBAL
@@ -379,3 +379,4 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
+
