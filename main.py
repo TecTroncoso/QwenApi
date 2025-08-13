@@ -237,9 +237,10 @@ async def sse_stream(
                     pid = ev["response.created"].get("response_id")
                     if pid:
                         state.last_parent_id = pid
-                        await redis_client.register_script(LUA_GET_SET_EX)(
-                            keys=[f"qwen_conv:{chat_id}"],
-                            args=[state.model_dump_json(), "86400"]
+                        await redis_client.set(
+                            f"qwen_conv:{chat_id}",
+                            state.model_dump_json(),
+                            ex=86400
                         )
                     continue
 
@@ -373,4 +374,5 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
+
 
