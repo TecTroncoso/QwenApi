@@ -1,4 +1,4 @@
-# main_memory.py – 100 % optimizado + memoria persistente
+# main_memory_fixed.py – 100 % optimizado + memoria persistente + sin coroutines en headers
 # ==============================================================================
 import asyncio
 import base64
@@ -29,7 +29,7 @@ JSON_DESERIALIZER = orjson.loads
 # ---------- GLOBAL CONFIG ----------
 load_dotenv()
 API_TITLE = "Qwen Web API Proxy (MEMORY-FIXED)"
-API_VERSION = "14.0.0"
+API_VERSION = "15.0.0"
 
 MODEL_CONFIG = {
     "qwen-final": {"internal_model_id": "qwen3-235b-a22b", "filter_phase": True},
@@ -319,18 +319,17 @@ async def chat_completions(request: Request):
     # Recuperar / inicializar estado
     state_json = await redis_client.get(f"qwen_conv:{chat_id}")
     state = ConversationState.model_validate_json(state_json or "{}")
-    prompt_text = prompt
 
     is_stream = body.get("stream", False)
     if is_stream:
         return StreamingResponse(
-            sse_stream(chat_id, state, prompt_text, model_name, MODEL_CONFIG[model_name]),
+            sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]),
             media_type="text/event-stream",
-            headers={"X-Conversation-ID": chat_id},
+            headers={"X-Conversation-ID": str(chat_id)},
         )
     else:
         full = []
-        async for chunk in sse_stream(chat_id, state, prompt_text, model_name, MODEL_CONFIG[model_name]):
+        async for chunk in sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]):
             if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                 try:
                     data = JSON_DESERIALIZER(chunk[6:])
@@ -338,13 +337,13 @@ async def chat_completions(request: Request):
                         full.append(data["choices"][0]["delta"].get("content", ""))
                 except Exception:
                     pass
-        # Persistir estado tras respuesta no-stream
+        content = "".join(full)
+        # Persistir estado ANTES de devolver la respuesta
         await redis_client.set(
             f"qwen_conv:{chat_id}",
             state.model_dump_json(),
             ex=86400
         )
-        content = "".join(full)
         return JSONResponse(
             {
                 "id": f"chatcmpl-{uuid.uuid4()}",
@@ -354,11 +353,9 @@ async def chat_completions(request: Request):
                 "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             },
-            headers={"X-Conversation-ID": chat_id},
+            headers={"X-Conversation-ID": str(chat_id)},
         )
 
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
-
-
