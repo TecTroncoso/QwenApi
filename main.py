@@ -338,7 +338,7 @@ async def chat_completions(request: Request):
         chat_id = await redis_client.lpop(POOL_KEY)
         await redis_client.set(chat_key, chat_id, ex=86400 * 7)
 
-    # 4️⃣  Recuperar estado (parent_id)
+    # 4️⃣  Recuperar estado (parent_id) desde Redis
     state = ConversationState(last_parent_id=None)
     state_raw = await redis_client.get(state_key)
     if state_raw:
@@ -354,13 +354,12 @@ async def chat_completions(request: Request):
     # 5️⃣  Envolver el generador para actualizar el estado al recibir response_id
     async def wrapped_stream():
         async for chunk in sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]):
-            # Guardar parent_id cuando llegue "response.created"
-            if chunk.startswith("data: ") and "response.created" in chunk:
+            # Parsear el chunk para capturar response.created
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                 try:
-                    ev = JSON_DESERIALIZER(chunk[6:])
-                    pid = ev.get("response.created", {}).get("response_id")
-                    if pid:
-                        await update_state(pid)
+                    data = JSON_DESERIALIZER(chunk[6:])
+                    if data.get("response.created", {}).get("response_id"):
+                        await update_state(data["response.created"]["response_id"])
                 except Exception:
                     pass
             yield chunk
@@ -379,7 +378,6 @@ async def chat_completions(request: Request):
                     data = JSON_DESERIALIZER(chunk[6:])
                     if data.get("choices"):
                         full.append(data["choices"][0]["delta"].get("content", ""))
-                    # Guardar parent_id cuando llegue "response.created"
                     if data.get("response.created", {}).get("response_id"):
                         await update_state(data["response.created"]["response_id"])
                 except Exception:
@@ -400,4 +398,5 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
+
 
