@@ -1,12 +1,10 @@
-# main_fixed.py – Render-ready, no UnboundLocalError
-# ==============================================================================
 import asyncio
 import base64
 import os
 import socket
 import time
 import uuid
-import xxhash
+import hashlib  # <--- CAMBIO: Usamos hashlib para un hash estándar y consistente
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -28,8 +26,8 @@ JSON_DESERIALIZER = orjson.loads
 
 # ---------- GLOBAL CONFIG ----------
 load_dotenv()
-API_TITLE = "Qwen Web API Proxy (RENDER-FIXED)"
-API_VERSION = "13.0.0"
+API_TITLE = "Qwen Web API Proxy (RENDER-FIXED & CONTEXT-FIXED)"
+API_VERSION = "14.0.0" # Versión actualizada con la corrección de contexto
 
 MODEL_CONFIG = {
     "qwen-final":     {"internal_model_id": "qwen3-235b-a22b",  "filter_phase": True},
@@ -129,7 +127,7 @@ client = httpx.AsyncClient(
 # ---------- POOL ----------
 MIN_POOL, MAX_POOL = 2, 5
 POOL_KEY = "qwen_chat_id_pool"
-lua_script = None   # will be set in lifespan
+lua_script = None
 
 async def create_chat(internal_model: str) -> Optional[str]:
     payload = {
@@ -143,7 +141,8 @@ async def create_chat(internal_model: str) -> Optional[str]:
         r = await client.post(f"{QWEN_API_BASE_URL}/chats/new", json=payload, headers=_build_headers())
         r.raise_for_status()
         return r.json()["data"]["id"]
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Failed to create chat for pool: {e}")
         return None
 
 async def pool_manager(internal_model: str):
@@ -156,20 +155,22 @@ async def pool_manager(internal_model: str):
                 tasks = [create_chat(internal_model) for _ in range(needed)]
                 created = [cid for cid in await asyncio.gather(*tasks) if cid]
                 if created:
-                    pipe = redis_client.pipeline()
-                    pipe.rpush(POOL_KEY, *created)
-                    await pipe.execute()
+                    await redis_client.rpush(POOL_KEY, *created)
             await asyncio.sleep(10)
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Pool manager failed: {e}")
             await asyncio.sleep(30)
 
-@lru_cache(maxsize=1000)
-def _cached_hash_lookup(prompt_hash: str) -> Optional[str]:
-    import redis
-    r = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
-    return r.get(f"conv_hash:{prompt_hash}")
+# La caché LRU en memoria no es ideal para este caso de uso,
+# ya que el hash de conversación debe persistir entre reinicios del servidor.
+# Usaremos Redis directamente, que es más robusto.
+# @lru_cache(maxsize=1000)
+# def _cached_hash_lookup(prompt_hash: str) -> Optional[str]:
+#     import redis
+#     r = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
+#     return r.get(f"conv_hash:{prompt_hash}")
 
 # ---------- STREAMING ----------
 BATCH_MS = 0.020
@@ -236,11 +237,10 @@ async def sse_stream(
                 if ev.get("response.created"):
                     pid = ev["response.created"].get("response_id")
                     if pid:
+                        # Actualizamos el estado con el nuevo parent_id
                         state.last_parent_id = pid
-                        await redis_client.register_script(LUA_GET_SET_EX)(
-                            keys=[f"qwen_conv:{chat_id}"],
-                            args=[state.model_dump_json(), "86400"]
-                        )
+                        # Guardamos el estado actualizado en Redis para la siguiente petición
+                        await redis_client.set(f"qwen_conv:{chat_id}", state.model_dump_json(), ex=86400)
                     continue
 
                 delta = ev.get("choices", [{}])[0].get("delta", {})
@@ -251,13 +251,7 @@ async def sse_stream(
 
                 now = time.time()
                 if buffer and (len(buffer) >= BATCH_TOK or now - last_flush >= BATCH_MS):
-                    chunk = {
-                        "id": comp_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}],
-                    }
+                    chunk = {"id": comp_id, "object": "chat.completion.chunk", "created": created, "model": model_name, "choices": [{"delta": {"content": "".join(buffer)}, "index": 0}]}
                     yield f"data: {JSON_SERIALIZER(chunk)}\n\n"
                     buffer.clear()
                     last_flush = now
@@ -288,10 +282,8 @@ async def lifespan(app: FastAPI):
     mgr = asyncio.create_task(pool_manager(next(iter(MODEL_CONFIG.values()))["internal_model_id"]))
     yield
     mgr.cancel()
-    try:
-        await mgr
-    except asyncio.CancelledError:
-        pass
+    try: await mgr
+    except asyncio.CancelledError: pass
     await client.aclose()
 
 app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
@@ -299,14 +291,11 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 @app.get("/v1/models")
 def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": k, "object": "model", "created": int(time.time()), "owned_by": "proxy"}
-            for k in MODEL_CONFIG
-        ],
-    }
+    return {"object": "list", "data": [{"id": k, "object": "model", "created": int(time.time()), "owned_by": "proxy"} for k in MODEL_CONFIG]}
 
+# ==============================================================================
+# --- ENDPOINT DE CHAT COMPLETIONS CORREGIDO ---
+# ==============================================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
@@ -315,74 +304,77 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=404, detail="Model not found")
 
     messages = body.get("messages")
-    if not messages:
-        raise HTTPException(status_code=400, detail="Messages required")
+    if not messages or not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="El campo 'messages' debe ser una lista no vacía.")
+
+    # --- INICIO DE LA LÓGICA DE CONTEXTO CORREGIDA ---
+
+    # 1. Usar el PRIMER mensaje para crear un hash estable que identifique toda la conversación.
+    #    Este es el cambio clave para mantener la memoria entre turnos.
+    try:
+        first_user_message_content = messages[0].get("content", "")
+        if not first_user_message_content:
+             raise ValueError("El primer mensaje de la conversación no tiene contenido.")
+        
+        conversation_hash = hashlib.sha256(first_user_message_content.encode('utf-8')).hexdigest()
+        redis_conv_hash_key = f"conv_hash:{conversation_hash}"
+    except (IndexError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Error procesando los mensajes para obtener el contexto: {e}")
+
+    # 2. Buscar si ya existe un `chat_id` para esta conversación.
+    chat_id = await redis_client.get(redis_conv_hash_key)
+    state: ConversationState
+
+    if not chat_id:
+        print(f"✨ Nueva conversación detectada (hash: {conversation_hash[:8]}). Obteniendo ID del pool...")
+        # Si no existe, es una conversación nueva. Tomamos un ID del pool.
+        if await redis_client.llen(POOL_KEY) == 0:
+            raise HTTPException(status_code=429, detail="Pool de chats vacío, por favor reintenta más tarde.")
+        
+        chat_id = await redis_client.lpop(POOL_KEY)
+        if not chat_id:
+            raise HTTPException(status_code=429, detail="Pool de chats vacío al intentar obtener un ID, por favor reintenta.")
+        
+        # Guardamos la asociación: hash de la conversación -> chat_id de Qwen
+        await redis_client.set(redis_conv_hash_key, chat_id, ex=86400 * 7) # Persiste por 7 días
+        print(f"✅ Conversación asociada: hash {conversation_hash[:8]} -> Qwen ID {chat_id[:8]}")
+        # Creamos un estado inicial vacío (sin parent_id)
+        state = ConversationState(last_parent_id=None)
+    else:
+        print(f"➡️ Conversación existente reconocida (hash: {conversation_hash[:8]}). Usando ID: {chat_id[:8]}...")
+        # Si existe, cargamos su estado (que contendrá el `last_parent_id` de la última respuesta)
+        state_json = await redis_client.get(f"qwen_conv:{chat_id}")
+        state = ConversationState.model_validate_json(state_json or "{}")
+
+    # 3. El prompt a enviar es siempre el último mensaje del historial.
     last_msg = messages[-1]
     if last_msg.get("role") != "user":
-        raise HTTPException(status_code=400, detail="Last message must be user")
-
-    # 1️⃣  Generar 'conversation_id' estable a partir de TODOS los mensajes
-    concat = "\n".join(f"{m['role']}:{m['content']}" for m in messages)
-    conversation_id = xxhash.xxh64(concat.encode()).hexdigest()
-
-    # 2️⃣  Claves en Redis
-    chat_key = f"conv_chat:{conversation_id}"
-    state_key = f"conv_state:{conversation_id}"
-
-    # 3️⃣  Recuperar o crear chat_id
-    chat_id = await redis_client.get(chat_key)
-    if not chat_id:
-        llen = await redis_client.llen(POOL_KEY)
-        if llen == 0:
-            raise HTTPException(status_code=429, detail="Pool empty, retry later")
-        chat_id = await redis_client.lpop(POOL_KEY)
-        await redis_client.set(chat_key, chat_id, ex=86400 * 7)
-
-    # 4️⃣  Recuperar estado (parent_id) desde Redis
-    state = ConversationState(last_parent_id=None)
-    state_raw = await redis_client.get(state_key)
-    if state_raw:
-        state = ConversationState.model_validate_json(state_raw)
-
+        raise HTTPException(status_code=400, detail="El último mensaje del historial debe tener el rol 'user'")
+    
     prompt = last_msg.get("content", "")
+
+    # --- FIN DE LA LÓGICA DE CONTEXTO CORREGIDA ---
+
     is_stream = body.get("stream", False)
-
-    async def update_state(parent_id: str):
-        state.last_parent_id = parent_id
-        await redis_client.set(state_key, state.model_dump_json(), ex=86400)
-
-    # 5️⃣  Envolver el generador para actualizar el estado al recibir response_id
-    async def wrapped_stream():
-        async for chunk in sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]):
-            # Parsear el chunk para capturar response.created
-            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
-                try:
-                    data = JSON_DESERIALIZER(chunk[6:])
-                    if data.get("response.created", {}).get("response_id"):
-                        await update_state(data["response.created"]["response_id"])
-                except Exception:
-                    pass
-            yield chunk
-
+    # Pasamos el `chat_id` y el `state` recuperado/creado a la función de streaming
     if is_stream:
         return StreamingResponse(
-            wrapped_stream(),
+            sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]),
             media_type="text/event-stream",
             headers={"X-Conversation-ID": chat_id},
         )
     else:
-        full = []
+        full_content = []
+        # La función sse_stream se encargará de actualizar el estado en Redis internamente
         async for chunk in sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]):
             if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                 try:
                     data = JSON_DESERIALIZER(chunk[6:])
                     if data.get("choices"):
-                        full.append(data["choices"][0]["delta"].get("content", ""))
-                    if data.get("response.created", {}).get("response_id"):
-                        await update_state(data["response.created"]["response_id"])
+                        full_content.append(data["choices"][0]["delta"].get("content", ""))
                 except Exception:
                     pass
-        content = "".join(full)
+        content = "".join(full_content)
         return JSONResponse(
             {
                 "id": f"chatcmpl-{uuid.uuid4()}",
@@ -398,5 +390,3 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
-
-
