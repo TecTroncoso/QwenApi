@@ -313,6 +313,7 @@ async def chat_completions(request: Request):
     model_name = body.get("model")
     if model_name not in MODEL_CONFIG:
         raise HTTPException(status_code=404, detail="Model not found")
+
     messages = body.get("messages")
     if not messages:
         raise HTTPException(status_code=400, detail="Messages required")
@@ -320,30 +321,53 @@ async def chat_completions(request: Request):
     if last_msg.get("role") != "user":
         raise HTTPException(status_code=400, detail="Last message must be user")
 
-    prompt = last_msg.get("content", "")
-    loop = asyncio.get_running_loop()
-    prompt_hash = await loop.run_in_executor(None, xxhash.xxh64, prompt.encode())
-    prompt_hash = prompt_hash.hexdigest()
+    # 1️⃣  Generar 'conversation_id' estable a partir de TODOS los mensajes
+    concat = "\n".join(f"{m['role']}:{m['content']}" for m in messages)
+    conversation_id = xxhash.xxh64(concat.encode()).hexdigest()
 
-    chat_id = _cached_hash_lookup(prompt_hash)
+    # 2️⃣  Claves en Redis
+    chat_key = f"conv_chat:{conversation_id}"
+    state_key = f"conv_state:{conversation_id}"
+
+    # 3️⃣  Recuperar o crear chat_id
+    chat_id = await redis_client.get(chat_key)
     if not chat_id:
         llen = await redis_client.llen(POOL_KEY)
         if llen == 0:
             raise HTTPException(status_code=429, detail="Pool empty, retry later")
         chat_id = await redis_client.lpop(POOL_KEY)
-        if not chat_id:
-            raise HTTPException(status_code=429, detail="Pool empty, retry later")
-        await redis_client.set(f"conv_hash:{prompt_hash}", chat_id, ex=86400 * 7)
+        await redis_client.set(chat_key, chat_id, ex=86400 * 7)
 
+    # 4️⃣  Recuperar estado (parent_id)
     state = ConversationState(last_parent_id=None)
-    state = ConversationState.model_validate_json(
-        await redis_client.get(f"qwen_conv:{chat_id}") or "{}"
-    )
+    state_raw = await redis_client.get(state_key)
+    if state_raw:
+        state = ConversationState.model_validate_json(state_raw)
 
+    prompt = last_msg.get("content", "")
     is_stream = body.get("stream", False)
+
+    async def update_state(parent_id: str):
+        state.last_parent_id = parent_id
+        await redis_client.set(state_key, state.model_dump_json(), ex=86400)
+
+    # 5️⃣  Envolver el generador para actualizar el estado al recibir response_id
+    async def wrapped_stream():
+        async for chunk in sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]):
+            # Guardar parent_id cuando llegue "response.created"
+            if chunk.startswith("data: ") and "response.created" in chunk:
+                try:
+                    ev = JSON_DESERIALIZER(chunk[6:])
+                    pid = ev.get("response.created", {}).get("response_id")
+                    if pid:
+                        await update_state(pid)
+                except Exception:
+                    pass
+            yield chunk
+
     if is_stream:
         return StreamingResponse(
-            sse_stream(chat_id, state, prompt, model_name, MODEL_CONFIG[model_name]),
+            wrapped_stream(),
             media_type="text/event-stream",
             headers={"X-Conversation-ID": chat_id},
         )
@@ -355,6 +379,9 @@ async def chat_completions(request: Request):
                     data = JSON_DESERIALIZER(chunk[6:])
                     if data.get("choices"):
                         full.append(data["choices"][0]["delta"].get("content", ""))
+                    # Guardar parent_id cuando llegue "response.created"
+                    if data.get("response.created", {}).get("response_id"):
+                        await update_state(data["response.created"]["response_id"])
                 except Exception:
                     pass
         content = "".join(full)
@@ -373,3 +400,4 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
+
