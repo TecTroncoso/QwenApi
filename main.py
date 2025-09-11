@@ -29,10 +29,14 @@ API_TITLE = "Qwen Web API Proxy (Hyper-Optimized)"
 API_VERSION = "15.0.0" # Versión con optimizaciones de latencia avanzada
 
 MODEL_CONFIG = {
-    "qwen-final":     {"internal_model_id": "qwen3-235b-a22b",  "filter_phase": True},
-    "qwen-thinking":  {"internal_model_id": "qwen3-235b-a22b",  "filter_phase": False},
-    "qwen-coder-plus":{"internal_model_id": "qwen3-coder-plus", "filter_phase": True},
-    "qwen-coder-30b": {"internal_model_id": "qwen3-coder-30b-a3b-instruct", "filter_phase": True},
+    "qwen3-235b-a22b": {"internal_model_id": "qwen3-235b-a22b", "filter_phase": True},
+    "qwen3-235b-a22b-thinking": {"internal_model_id": "qwen3-235b-a22b", "filter_phase": False},
+    "qwen3-coder": {"internal_model_id": "qwen3-coder-plus", "filter_phase": True},
+    "qwen3-coder-flash": {"internal_model_id": "qwen3-coder-30b-a3b-instruct", "filter_phase": True},
+    "qwen3-max": {"internal_model_id": "qwen3-max-preview", "filter_phase": True"},
+    "qwen3-max-thinking": {"internal_model_id": "qwen3-max-preview", "filter_phase": False},
+    "qwen3-next": {"internal_model_id": "qwen-plus-2025-09-11", "filter_phase": True},
+    "qwen3-next-thinking": {"internal_model_id": "qwen-plus-2025-09-11", "filter_phase": False},
 }
 
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
@@ -287,3 +291,4 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
+
