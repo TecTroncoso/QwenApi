@@ -33,7 +33,7 @@ MODEL_CONFIG = {
     "qwen3-235b-a22b-thinking": {"internal_model_id": "qwen3-235b-a22b", "filter_phase": False},
     "qwen3-coder": {"internal_model_id": "qwen3-coder-plus", "filter_phase": True},
     "qwen3-coder-flash": {"internal_model_id": "qwen3-coder-30b-a3b-instruct", "filter_phase": True},
-    "qwen3-max": {"internal_model_id": "qwen3-max-preview", "filter_phase": True"},
+    "qwen3-max": {"internal_model_id": "qwen3-max-preview", "filter_phase": True},
     "qwen3-max-thinking": {"internal_model_id": "qwen3-max-preview", "filter_phase": False},
     "qwen3-next": {"internal_model_id": "qwen-plus-2025-09-11", "filter_phase": True},
     "qwen3-next-thinking": {"internal_model_id": "qwen-plus-2025-09-11", "filter_phase": False},
@@ -291,4 +291,5 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
+
 
