@@ -37,6 +37,11 @@ MODEL_CONFIG = {
     "qwen3-max-thinking": {"internal_model_id": "qwen3-max-preview", "filter_phase": False},
     "qwen3-next": {"internal_model_id": "qwen-plus-2025-09-11", "filter_phase": True},
     "qwen3-next-thinking": {"internal_model_id": "qwen-plus-2025-09-11", "filter_phase": False},
+    "qwen3-max-25-9-2025": {"internal_model_id": "qwen3-max", "filter_phase": True},
+    "Qwen3-VL-235B-A22B": {"internal_model_id": "qwen3-vl-plus", "filter_phase": True},
+    "Qwen3-VL-235B-A22B-thinking": {"internal_model_id": "qwen3-vl-plus", "filter_phase": False},
+    "qwen3-omni-flash": {"internal_model_id": "qwen3-omni-flash", "filter_phase": True},
+    "Qwen3-Omni-thinking": {"internal_model_id": "qwen3-omni-flash", "filter_phase": False},
 }
 
 QWEN_API_BASE_URL = "https://chat.qwen.ai/api/v2"
@@ -291,5 +296,6 @@ async def chat_completions(request: Request):
 @app.get("/")
 def root():
     return {"status": "OK", "message": f"{API_TITLE} is live"}
+
 
 
