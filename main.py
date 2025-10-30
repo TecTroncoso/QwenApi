@@ -10,6 +10,8 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from dotenv import load_dotenv
+load_dotenv() # Carga las variables del archivo .env al entorno (si el archivo existe)
 # --- Carga Dinámica de Cookies desde Variables de Entorno ---
 
 def format_cookies_from_json_string(json_string: str) -> str:
@@ -33,7 +35,7 @@ def format_cookies_from_json_string(json_string: str) -> str:
 # 1. Obtener la variable de entorno con las cookies en Base64.
 #    En Render, debes crear una variable de entorno llamada QWEN_COOKIES_JSON
 #    y pegar el contenido Base64 que tienes.
-encoded_cookies = os.getenv("QWEN_COOKIES_JSON")
+encoded_cookies = os.getenv("QWEN_COOKIES_JSON_B64")
 
 if not encoded_cookies:
     raise ValueError("La variable de entorno 'QWEN_COOKIES_JSON' no está definida. La API no puede funcionar sin cookies.")
@@ -253,3 +255,4 @@ async def reset_session():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
