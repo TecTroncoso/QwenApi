@@ -2,62 +2,54 @@ import json
 import time
 import uuid
 import httpx
-import os
-import base64
+import os      # <--- Importado
+import base64  # <--- Importado
 from typing import List, Dict, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from dotenv import load_dotenv
-load_dotenv() # Carga las variables del archivo .env al entorno (si el archivo existe)
-# --- Carga Dinámica de Cookies desde Variables de Entorno ---
+# --- FUNCIÓN PARA CARGAR Y FORMATEAR COOKIES DESDE ENV ---
+def load_and_format_cookies() -> str:
+    """
+    Carga el JSON de cookies desde una variable de entorno Base64,
+    lo decodifica y lo formatea en una cadena de header 'Cookie'.
+    """
+    b64_cookies = os.getenv("QWEN_COOKIES_JSON_B64")
+    if not b64_cookies:
+        raise RuntimeError(
+            "La variable de entorno 'QWEN_COOKIES_JSON_B64' no está definida o está vacía. "
+            "Asegúrate de configurar esta variable con las cookies codificadas en Base64."
+        )
 
-def format_cookies_from_json_string(json_string: str) -> str:
-    """
-    Toma un string JSON (que contiene una lista de objetos de cookies de Selenium),
-    lo parsea y lo formatea en un único string de header 'Cookie'.
-    Ejemplo de formato de salida: 'name1=value1; name2=value2; ...'
-    """
     try:
-        cookies_list = json.loads(json_string)
-        if not isinstance(cookies_list, list):
-            raise TypeError("El JSON de cookies no es una lista.")
-            
-        # Formatea cada cookie como 'name=value' y las une con '; '
+        # 1. Decodificar de Base64 a bytes, y luego a string UTF-8
+        decoded_cookies_json = base64.b64decode(b64_cookies).decode('utf-8')
+        
+        # 2. Cargar el string JSON en una lista de Python
+        cookies_list = json.loads(decoded_cookies_json)
+        
+        # 3. Formatear la lista en una sola cadena para el header
+        # Ejemplo: [{'name': 'token', 'value': 'abc'}, {'name': 'id', 'value': '123'}]
+        # se convierte en -> "token=abc; id=123"
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in cookies_list])
+        
+        print("✅ Cookies cargadas y formateadas exitosamente desde la variable de entorno.")
         return cookie_string
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
-        print(f"Error al procesar el JSON de las cookies: {e}")
-        raise ValueError("El formato del JSON de cookies es inválido.") from e
 
-# 1. Obtener la variable de entorno con las cookies en Base64.
-#    En Render, debes crear una variable de entorno llamada QWEN_COOKIES_JSON
-#    y pegar el contenido Base64 que tienes.
-encoded_cookies = os.getenv("QWEN_COOKIES_JSON_B64")
+    except (base64.binascii.Error, json.JSONDecodeError, TypeError, KeyError) as e:
+        print(f"❌ Error al decodificar, parsear o formatear las cookies: {e}")
+        raise RuntimeError(
+            "El valor de 'QWEN_COOKIES_JSON_B64' es inválido. "
+            "Debe ser una cadena Base64 que decodifique a un JSON válido con la estructura de cookies de Selenium."
+        )
 
-if not encoded_cookies:
-    raise ValueError("La variable de entorno 'QWEN_COOKIES_JSON' no está definida. La API no puede funcionar sin cookies.")
-
-try:
-    # 2. Decodificar de Base64 a un string de texto (que es el JSON).
-    decoded_json_string = base64.b64decode(encoded_cookies).decode('utf-8')
-
-    # 3. Formatear el JSON en el string de cookie que necesita el header.
-    dynamic_cookie_header = format_cookies_from_json_string(decoded_json_string)
-    print("✅ Cookies cargadas y formateadas exitosamente desde la variable de entorno.")
-
-except Exception as e:
-    print(f"❌ Error crítico al cargar/decodificar las cookies: {e}")
-    # Si falla, la aplicación no debe iniciar.
-    raise
-
-# 4. Construir los headers usando la cookie dinámica.
+# --- Configuración ---
 QWEN_HEADERS = {
     "Accept": "text/event-stream",
     "Accept-Language": "es-AR,es;q=0.8",
-    "Cookie": dynamic_cookie_header,  # <-- ¡AQUÍ USAMOS LA COOKIE DINÁMICA!
+    # La cookie hardcodeada se elimina. Se cargará dinámicamente a continuación.
     "Origin": "https://chat.qwen.ai",
     "Referer": "https://chat.qwen.ai/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
@@ -65,7 +57,15 @@ QWEN_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
-# --- El resto del código permanece exactamente igual ---
+# --- Carga dinámica de las cookies al iniciar la aplicación ---
+try:
+    # Llenamos dinámicamente el header 'Cookie' al arrancar la app
+    QWEN_HEADERS["Cookie"] = load_and_format_cookies()
+except RuntimeError as e:
+    # Si las cookies no se pueden cargar, la aplicación no debe iniciar.
+    # Esto te avisará en los logs de Render si algo está mal configurado.
+    print(f"FATAL: {e}")
+    exit(1)
 
 QWEN_BASE_URL = "https://chat.qwen.ai/api/v2"
 
@@ -114,8 +114,8 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
 
 # --- Lógica del Proxy ---
+
 async def create_new_chat_session(client: httpx.AsyncClient, model_name: str) -> Optional[str]:
-    # ... (el resto de tu código no necesita cambios)
     """Crea una nueva sesión de chat en Qwen para el modelo especificado."""
     payload = {
         "title": "Nuevo Chat",
@@ -133,11 +133,10 @@ async def create_new_chat_session(client: httpx.AsyncClient, model_name: str) ->
             print(f"Nueva sesión de chat creada con ID: {chat_id} para el modelo {model_name}")
             return chat_id
     except httpx.HTTPStatusError as e:
-        print(f"Error al crear la sesión de chat: {e.response.text}")
+        print(f"Error al crear la sesión de chat: {e.response.status_code} - {e.response.text}")
     return None
 
 async def stream_generator(request: ChatCompletionRequest):
-    # ... (el resto de tu código no necesita cambios)
     """Generador que maneja el flujo de chat, con validación estricta de modelos."""
     global chat_session
 
@@ -156,7 +155,7 @@ async def stream_generator(request: ChatCompletionRequest):
             if not chat_session.get("chat_id"):
                 chat_id = await create_new_chat_session(client, model_name=qwen_model_name)
                 if not chat_id:
-                    error_chunk = {"id": f"chatcmpl-{uuid.uuid4()}", "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"index": 0, "delta": {"content": "Error: No se pudo crear una nueva sesión de chat en Qwen."}, "finish_reason": "error"}]}
+                    error_chunk = {"id": f"chatcmpl-{uuid.uuid4()}", "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"index": 0, "delta": {"content": "Error: No se pudo crear una nueva sesión de chat en Qwen. Revisa las cookies o el estado del servicio."}, "finish_reason": "error"}]}
                     yield f"data: {json.dumps(error_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -242,17 +241,20 @@ async def stream_generator(request: ChatCompletionRequest):
 async def chat_completions(request: ChatCompletionRequest):
     if not request.stream:
         raise HTTPException(status_code=400, detail="Esta implementación solo soporta streaming (stream=True).")
+    
     return StreamingResponse(stream_generator(request), media_type="text/event-stream")
 
 @app.get("/reset")
 async def reset_session():
+    """Reinicia la sesión de chat actual, forzando la creación de una nueva en la siguiente petición."""
     global chat_session
     chat_session["chat_id"] = None
     chat_session["parent_id"] = None
-    print("Sesión de chat reiniciada.")
+    print("Sesión de chat reiniciada manualmente.")
     return {"message": "Sesión de chat reiniciada."}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
+    # Si vas a nombrar el archivo 'api.py', el comando para ejecutarlo es:
+    # uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
